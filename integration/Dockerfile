@@ -1,6 +1,6 @@
 # Alpine keeps SMB1 (NT1) server support compiled into its samba package;
 # some distros build with --without-smb1-server, which would break these tests.
-FROM alpine:3.20
+FROM alpine:3.24
 
 # samba-client provides smbclient, used to verify the server accepts NT1.
 RUN apk add --no-cache samba samba-client
