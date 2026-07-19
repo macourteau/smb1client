@@ -1,0 +1,34 @@
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every GitHub Actions bump auto-merges (their majors are frequent and
+      # low-risk here); for Go deps and the Samba container base image,
+      # everything except a major auto-merges. A major dependency bump is left
+      # for a human. Auto-merge waits for the required build-test checks via
+      # branch protection before landing.
+      - name: Approve and merge
+        if: >-
+          steps.metadata.outputs.package-ecosystem == 'github_actions' ||
+          steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review "$PR_URL" --approve
+          gh pr merge "$PR_URL" --auto --squash

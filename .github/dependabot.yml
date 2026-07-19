@@ -1,0 +1,34 @@
+version: 2
+updates:
+  # Go module dependencies. The gomod ecosystem does not bump the `go`
+  # directive in go.mod — the floor stays at the lowest value the deps accept
+  # (policy in CLAUDE.md); if a bump needs a newer floor, the CI floor leg
+  # fails and a human raises the directive minimally.
+  # Dependency bumps ship to consumers, so they release: `fix` prefix.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "fix"
+      include: scope
+
+  # The GitHub Actions used by the workflows. CI-only: no release.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+
+  # Base image of the integration-test Samba container. Test-only: no release.
+  - package-ecosystem: docker
+    directory: /integration
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"
+      include: scope
