@@ -1,0 +1,73 @@
+name: Dependabot Go floor
+
+# When a Dependabot go_modules bump requires a newer go.mod `go` directive
+# than the current floor, CI's floor leg would fail and auto-merge would
+# never land it. This computes the floor the PR's dependency graph actually
+# needs and, if it exceeds the current directive, dispatches update-go-floor
+# with that value (workflow_dispatch is the documented exception to
+# "GITHUB_TOKEN events trigger no workflows", and it keeps the deploy key in
+# one workflow). Once the floor PR merges, Dependabot is asked to rebase so
+# the dep PR re-runs CI against the raised floor and its armed auto-merge
+# lands. Majors are excluded: they wait for a human, floor included.
+
+on: pull_request
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+
+jobs:
+  floor:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/checkout@v7
+        if: >-
+          steps.metadata.outputs.package-ecosystem == 'go_modules' &&
+          steps.metadata.outputs.update-type != 'version-update:semver-major'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-go@v7
+        if: >-
+          steps.metadata.outputs.package-ecosystem == 'go_modules' &&
+          steps.metadata.outputs.update-type != 'version-update:semver-major'
+        with:
+          go-version: stable
+
+      - name: Raise the floor if the bumped deps need it
+        if: >-
+          steps.metadata.outputs.package-ecosystem == 'go_modules' &&
+          steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          current=$(awk '/^go /{print $2}' go.mod)
+          needed=$(go list -m -f '{{.GoVersion}}' all | grep -v '^$' | sort -V | tail -1)
+          echo "current=$current needed=$needed"
+          if [ "$(printf '%s\n%s\n' "$current" "$needed" | sort -V | tail -1)" = "$current" ]; then
+            echo "floor already sufficient"
+            exit 0
+          fi
+          gh workflow run update-go-floor.yml -f floor="$needed"
+          # Wait for the floor PR to land on main, then rebase this dep PR so
+          # its checks re-run against the raised floor.
+          for i in $(seq 1 60); do
+            state=$(gh pr view auto/go-floor --json state --jq .state 2>/dev/null || echo NONE)
+            [ "$state" = "MERGED" ] && break
+            sleep 15
+          done
+          if [ "$state" != "MERGED" ]; then
+            echo "floor PR did not merge within 15 minutes" >&2
+            exit 1
+          fi
+          gh pr comment "$PR_URL" --body '@dependabot rebase'

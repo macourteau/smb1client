@@ -1,11 +1,11 @@
 name: Update Go floor
 
-# Maintains the go.mod `go` directive at the two-release support window:
-# when a new Go minor ships, the floor moves up to the previous minor. The
-# directive is a viral consumer-facing minimum, so this only ever RAISES it
-# to window-floor — never to latest, never lowered, and dep-forced raises
-# beyond the window stay with a human (the CI floor leg flags those on the
-# offending Dependabot PR). `go mod edit -go=` only; never `go mod tidy`.
+# Maintains the go.mod `go` directive at the lowest value satisfying both
+# lower bounds: Go's two-release support window (computed here weekly) and
+# the dependencies' own floors (dispatched with an explicit `floor` input by
+# dependabot-go-floor when a dep bump needs more). The directive is a viral
+# consumer-facing minimum, so this only ever RAISES it — never to latest,
+# never lowered. `go mod edit -go=` only; never `go mod tidy`.
 #
 # Pushes use a write deploy key (GO_FLOOR_DEPLOY_KEY): a GITHUB_TOKEN push
 # would trigger no workflows, the required checks would never run, and
@@ -16,6 +16,11 @@ on:
   schedule:
     - cron: "0 6 * * 1" # Monday 06:00 UTC, batches with the Dependabot wave
   workflow_dispatch:
+    inputs:
+      floor:
+        description: "Target floor (e.g. 1.26.0); empty computes the window floor"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -39,14 +44,21 @@ jobs:
 
       - name: Compute window floor
         id: floor
+        env:
+          REQUESTED: ${{ inputs.floor }}
         run: |
           set -euo pipefail
-          latest=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version')
-          case "$latest" in go1.*) ;; *) echo "unexpected version: $latest"; exit 1 ;; esac
-          minor=$(echo "$latest" | sed -E 's/^go1\.([0-9]+).*$/\1/')
-          floor="1.$((minor - 1)).0"
+          if [ -n "$REQUESTED" ]; then
+            case "$REQUESTED" in 1.[0-9]*) ;; *) echo "bad floor input: $REQUESTED"; exit 1 ;; esac
+            floor="$REQUESTED"
+          else
+            latest=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version')
+            case "$latest" in go1.*) ;; *) echo "unexpected version: $latest"; exit 1 ;; esac
+            minor=$(echo "$latest" | sed -E 's/^go1\.([0-9]+).*$/\1/')
+            floor="1.$((minor - 1)).0"
+          fi
           current=$(awk '/^go /{print $2}' go.mod)
-          echo "latest=$latest window-floor=$floor current=$current"
+          echo "target-floor=$floor current=$current"
           # Raise only: proceed when floor is strictly newer than current.
           if [ "$floor" = "$current" ] || \
              [ "$(printf '%s\n%s\n' "$current" "$floor" | sort -V | tail -1)" != "$floor" ]; then
@@ -56,7 +68,7 @@ jobs:
           fi
           echo "update=true" >> "$GITHUB_OUTPUT"
           echo "floor=$floor" >> "$GITHUB_OUTPUT"
-          echo "short=1.$((minor - 1))" >> "$GITHUB_OUTPUT"
+          echo "short=$(echo "$floor" | sed 's/\.0$//')" >> "$GITHUB_OUTPUT"
 
       - name: Open floor-raise PR
         if: steps.floor.outputs.update == 'true'
