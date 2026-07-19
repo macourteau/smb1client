@@ -70,4 +70,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design and
   MaxMpxCount.
 - **Security scope**: NTLM v2 only, no SMB signing/encryption. For legacy
   SMB1-only servers in isolated networks.
+- **Go version floor**: the `go` directive in go.mod is a consumer-facing
+  minimum, kept at the oldest release the module supports (Go's two-release
+  support window; currently also pinned by golang.org/x/crypto's own floor).
+  Bump it only when a new Go release ships or a dependency forces it — never
+  to the latest version just because development uses a newer toolchain, and
+  never to a nonzero patch level.
 - **Commit messages**: no AI attribution. Example: "Fix read truncation by respecting uint16 limit"
