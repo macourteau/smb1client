@@ -1,0 +1,96 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE-specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Network packet captures
+*.pcap
+*.cap
+*.pcapng
+
+# Development and debugging files (one-off tests)
+manual_check.go
+test_*.go
+!*_test.go
+debug_*.go
+temp_*.go
+
+# Shell and Python scripts (development automation)
+*.pl
+*.rb
+
+# Investigation and progress tracking documents
+*INVESTIGATION*.md
+*_CHECKLIST.md
+TODO.md
+NOTES.md
+
+# Backup files
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# Build artifacts
+/bin/
+/dist/
+/build/
+
+# Example binaries (built from examples/*/main.go)
+examples/*/advanced
+examples/*/basic
+examples/*/comprehensive
+examples/*/dirops
+examples/*/fileops
+examples/*/pool
+examples/*/uploaddownload
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Log files
+*.log
+
+# Claude Code artifacts
+.claude/
+
+__pycache__/
