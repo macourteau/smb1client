@@ -1,0 +1,93 @@
+name: Release
+
+# Auto-versioning, zero-maintenance releases. Runs daily; if there are
+# releasable commits since the most recent tag, it computes the next semver
+# from their conventional-commit messages and publishes a GitHub Release (the
+# tag is the deliverable for a library — no assets). No release PRs, no manual
+# tagging. workflow_dispatch cuts one on demand; the dry_run input previews
+# the computed version without releasing.
+#
+# Bump rules: feat -> minor, fix -> patch, `!`/`BREAKING CHANGE` -> major.
+# Other types (chore/docs/refactor/test/ci) produce no release, and ranges
+# that touch no shippable file (*.go, go.mod, go.sum) never release.
+
+on:
+  schedule:
+    - cron: "0 12 * * *" # daily 12:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute the next version but do not release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false # never cancel a release; serialize instead
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history + tags for version computation
+
+      - name: Compute next version from conventional commits
+        id: ver
+        run: |
+          set -euo pipefail
+          LATEST=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$LATEST" ]; then
+            echo "no tags yet -> first release v0.1.0"
+            echo "next=v0.1.0" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$(git log "${LATEST}..HEAD" --oneline -- '*.go' go.mod go.sum)" ]; then
+            echo "no shippable changes since ${LATEST} -> nothing to release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          MSGS=$(git log "${LATEST}..HEAD" --format='%s%n%b')
+          bump=none
+          if grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' <<<"$MSGS" || grep -q 'BREAKING CHANGE' <<<"$MSGS"; then
+            bump=major
+          elif grep -qE '^feat(\([^)]*\))?:' <<<"$MSGS"; then
+            bump=minor
+          elif grep -qE '^fix(\([^)]*\))?:' <<<"$MSGS"; then
+            bump=patch
+          fi
+          if [ "$bump" = none ]; then
+            echo "shippable commits since ${LATEST}, but none are feat/fix/breaking -> no release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          v=${LATEST#v}; IFS=. read -r MA MI PA <<<"$v"
+          case "$bump" in
+            major) MA=$((MA + 1)); MI=0; PA=0 ;;
+            minor) MI=$((MI + 1)); PA=0 ;;
+            patch) PA=$((PA + 1)) ;;
+          esac
+          NEXT="v${MA}.${MI}.${PA}"
+          echo "bump=${bump}: ${LATEST} -> ${NEXT}"
+          echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+      - name: Dry run summary
+        if: steps.ver.outputs.release == 'true' && inputs.dry_run
+        run: echo "dry run — would release ${{ steps.ver.outputs.next }}"
+
+      - name: Create release (tag + notes)
+        if: steps.ver.outputs.release == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.next }}
+        run: |
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --generate-notes

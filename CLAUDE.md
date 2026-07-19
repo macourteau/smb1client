@@ -24,6 +24,7 @@ go test ./...                      # Unit tests (no server needed)
 ./test.sh                          # Same; args pass through to go test
 ./test.sh -race ./...              # Race detection
 go fmt ./... && go vet ./...       # Before committing
+staticcheck ./...                  # Before committing (also -tags integration)
 
 # Integration tests (dockerized Samba, NT1)
 integration/up.sh                  # Start server (idempotent)
@@ -76,4 +77,23 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design and
   Bump it only when a new Go release ships or a dependency forces it — never
   to the latest version just because development uses a newer toolchain, and
   never to a nonzero patch level.
-- **Commit messages**: no AI attribution. Example: "Fix read truncation by respecting uint16 limit"
+- **Commit messages**: Conventional Commits; no AI attribution. Example:
+  "fix: respect the uint16 limit when encoding read lengths"
+
+## CI and Releases
+
+- CI (`.github/workflows/ci.yml`): `build-test` runs the unit suite on two Go
+  toolchains — the go.mod floor and latest stable — and both matrix legs are
+  required checks on `main`. The `integration` job runs the dockerized-Samba
+  blackbox suite on pushes to `main` only.
+- Releases (`.github/workflows/release.yml`) are automatic: a daily job parses
+  Conventional Commit subjects since the last `v*` tag and publishes a GitHub
+  Release (the tag is the deliverable). Mapping: `feat:` → minor, `fix:` →
+  patch, `!`/`BREAKING CHANGE:` → major; `chore:/docs:/test:/refactor:/ci:` →
+  no release. A releasable change without a `feat:`/`fix:` prefix never ships
+  — prefix accordingly. Commits touching no shippable file (`*.go`, go.mod,
+  go.sum) never release.
+- Run the full CI-equivalent locally before pushing (the Build and Test
+  commands above plus the cross-builds: `GOOS=windows go build ./...`,
+  `GOOS=darwin GOARCH=arm64 go build ./...`); CI confirms, it does not
+  discover.
