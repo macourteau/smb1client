@@ -2,7 +2,6 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/macourteau/smb1client.svg)](https://pkg.go.dev/github.com/macourteau/smb1client)
 [![CI](https://github.com/macourteau/smb1client/actions/workflows/ci.yml/badge.svg)](https://github.com/macourteau/smb1client/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/macourteau/smb1client)](https://github.com/macourteau/smb1client/releases)
 
 ## ⚠️ Security Warning
 
