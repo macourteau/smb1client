@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    # auto/go-floor is pushed by update-go-floor via a deploy key so the
+    # required build-test checks fire for its PR — an event created with the
+    # default GITHUB_TOKEN would trigger no workflows.
+    branches: ["main", "auto/go-floor"]
   pull_request:
 
 concurrency:

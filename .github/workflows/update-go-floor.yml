@@ -1,0 +1,77 @@
+name: Update Go floor
+
+# Maintains the go.mod `go` directive at the two-release support window:
+# when a new Go minor ships, the floor moves up to the previous minor. The
+# directive is a viral consumer-facing minimum, so this only ever RAISES it
+# to window-floor — never to latest, never lowered, and dep-forced raises
+# beyond the window stay with a human (the CI floor leg flags those on the
+# offending Dependabot PR). `go mod edit -go=` only; never `go mod tidy`.
+#
+# Pushes use a write deploy key (GO_FLOOR_DEPLOY_KEY): a GITHUB_TOKEN push
+# would trigger no workflows, the required checks would never run, and
+# auto-merge would deadlock. ci.yml triggers on push to auto/go-floor for the
+# same reason.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC, batches with the Dependabot wave
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-go-floor
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ssh-key: ${{ secrets.GO_FLOOR_DEPLOY_KEY }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Compute window floor
+        id: floor
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version')
+          case "$latest" in go1.*) ;; *) echo "unexpected version: $latest"; exit 1 ;; esac
+          minor=$(echo "$latest" | sed -E 's/^go1\.([0-9]+).*$/\1/')
+          floor="1.$((minor - 1)).0"
+          current=$(awk '/^go /{print $2}' go.mod)
+          echo "latest=$latest window-floor=$floor current=$current"
+          # Raise only: proceed when floor is strictly newer than current.
+          if [ "$floor" = "$current" ] || \
+             [ "$(printf '%s\n%s\n' "$current" "$floor" | sort -V | tail -1)" != "$floor" ]; then
+            echo "floor is current -> nothing to do"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "update=true" >> "$GITHUB_OUTPUT"
+          echo "floor=$floor" >> "$GITHUB_OUTPUT"
+          echo "short=1.$((minor - 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Open floor-raise PR
+        if: steps.floor.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLOOR: ${{ steps.floor.outputs.floor }}
+          SHORT: ${{ steps.floor.outputs.short }}
+        run: |
+          set -euo pipefail
+          go mod edit -go="$FLOOR"
+          git diff -- go.mod
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b auto/go-floor
+          git commit -am "feat: raise the Go version floor to ${SHORT}"
+          git push --force-with-lease origin auto/go-floor
+          gh pr create --fill --head auto/go-floor 2>/dev/null || true
+          gh pr merge auto/go-floor --auto --squash

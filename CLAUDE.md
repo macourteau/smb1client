@@ -74,9 +74,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design and
 - **Go version floor**: the `go` directive in go.mod is a consumer-facing
   minimum, kept at the oldest release the module supports (Go's two-release
   support window; currently also pinned by golang.org/x/crypto's own floor).
-  Bump it only when a new Go release ships or a dependency forces it — never
-  to the latest version just because development uses a newer toolchain, and
-  never to a nonzero patch level.
+  Maintenance is automated: `update-go-floor.yml` raises it to the window
+  floor when a new Go minor ships (raise-only, `major.minor.0`). Never raise
+  it by hand to the latest version just because development uses a newer
+  toolchain. A dependency demanding more than the window floor fails the CI
+  floor leg on its Dependabot PR — that raise is a human call.
 - **Commit messages**: Conventional Commits; no AI attribution. Example:
   "fix: respect the uint16 limit when encoding read lengths"
 
