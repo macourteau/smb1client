@@ -1,0 +1,7 @@
+services:
+  samba:
+    build: .
+    container_name: smb1client-test
+    ports:
+      # Unprivileged host port; tests default to SMB_SERVER=localhost:10445.
+      - "10445:445"
