@@ -25,6 +25,20 @@ import (
 // testing for io.EOF would misread it as one.
 var ErrConnectionClosed = fmt.Errorf("smb1: connection closed: %w", net.ErrClosed)
 
+const (
+	// responseQueueDepth is how many response messages may be buffered for a
+	// single in-flight request before the receive loop starts dropping them.
+	// A TRANS2 reply split across several messages arrives back to back while
+	// the waiter is still reassembling, so one slot is not enough.
+	responseQueueDepth = 64
+
+	// maxTrans2Fragments bounds the number of messages accepted for one TRANS2
+	// reply. The largest reply this client asks for is 64 KiB, which a server
+	// sending the SMB1 minimum of 4356 bytes per message splits into 16; the
+	// cap only guards against a server that never signals completion.
+	maxTrans2Fragments = 64
+)
+
 // response represents a received SMB1 response waiting to be processed.
 type response struct {
 	header *smb1.Header
@@ -180,68 +194,204 @@ func (c *Conn) send(header *smb1.Header, params, data []byte) error {
 // sendRecv sends an SMB1 request and waits for the response.
 // It supports context cancellation and timeouts.
 func (c *Conn) sendRecv(header *smb1.Header, params, data []byte, ctx context.Context) (*response, error) {
+	respCh, mid, cleanup, err := c.beginRequest(header, params, data, ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	resp, err := c.awaitResponse(respCh, mid, ctx)
+	if err != nil {
+		return resp, err
+	}
+	return resp, resp.err
+}
+
+// awaitResponse waits for one message on respCh, honouring context
+// cancellation and connection teardown. The error status carried by the
+// message itself is left for the caller to act on.
+func (c *Conn) awaitResponse(respCh <-chan *response, mid uint16, ctx context.Context) (*response, error) {
 	logger := logging.FromContext(ctx)
 
-	logger.Debug("sendRecv: attempting to acquire lock for command 0x%02X", header.Command)
-	c.mu.Lock()
-	logger.Debug("sendRecv: lock acquired for command 0x%02X", header.Command)
-
-	// Check if connection is closed
-	select {
-	case <-c.done:
-		c.mu.Unlock()
-		return nil, c.err
-	default:
-	}
-
-	// Allocate message ID and create response channel
-	mid, err := c.allocateMID()
-	if err != nil {
-		c.mu.Unlock()
-		return nil, err
-	}
-	header.MID = mid
-	respCh := make(chan *response, 1)
-	c.pending[header.MID] = &pendingRequest{respCh: respCh, cancelled: false}
-	c.mu.Unlock()
-
-	logger.Debug("sendRecv: sending SMB command 0x%02X with MID %d", header.Command, header.MID)
-
-	// Cleanup: remove from pending map when done
-	defer func() {
-		c.mu.Lock()
-		delete(c.pending, header.MID)
-		c.mu.Unlock()
-	}()
-
-	// Encode packet
-	packet, err := smb1.EncodePacket(header, params, data)
-	if err != nil {
-		return nil, fmt.Errorf("smb1: failed to encode packet: %w", err)
-	}
-
-	// Send via NetBIOS
-	if err := c.netbiosConn.WritePacketContext(ctx, packet); err != nil {
-		c.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
-		return nil, err
-	}
-
-	// Wait for response or context cancellation
 	select {
 	case resp := <-respCh:
 		if resp.err != nil {
-			logger.Debug("sendRecv: received error response for MID %d: %v", header.MID, resp.err)
+			logger.Debug("sendRecv: received error response for MID %d: %v", mid, resp.err)
 		} else {
-			logger.Debug("sendRecv: received response for MID %d", header.MID)
+			logger.Debug("sendRecv: received response for MID %d", mid)
 		}
-		return resp, resp.err
+		return resp, nil
 	case <-ctx.Done():
-		logger.Debug("sendRecv: context cancelled for MID %d", header.MID)
+		logger.Debug("sendRecv: context cancelled for MID %d", mid)
 		return nil, ctx.Err()
 	case <-c.done:
-		logger.Debug("sendRecv: connection closed for MID %d", header.MID)
+		logger.Debug("sendRecv: connection closed for MID %d", mid)
 		return nil, c.err
 	}
+}
+
+// sendRecvTransaction sends a TRANS2 or TRANSACTION request and returns the
+// fully reassembled
+// response together with the header of its first message.
+//
+// A server answers a TRANS2 request with as many bytes as fit its own send
+// buffer, not as many as the request's MaxDataCount allows: Samba caps each
+// message at the negotiated max_xmit (~16 KiB), so a large directory listing
+// arrives split across several messages. Every message repeats the request's
+// MID and reports the totals for the whole reply in TotalParameterCount and
+// TotalDataCount, placing its own bytes at ParameterDisplacement and
+// DataDisplacement. Reading only the first message would drop whole directory
+// entries with no error to show for it, so keep reading until the accumulated
+// counts reach the totals.
+func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx context.Context) (*response, *smb1.Trans2Response, error) {
+	respCh, mid, cleanup, err := c.beginRequest(header, params, data, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cleanup()
+
+	logger := logging.FromContext(ctx)
+
+	var (
+		first          *response
+		assembled      *smb1.Trans2Response
+		paramBuf       []byte
+		dataBuf        []byte
+		gotParams      int
+		gotData        int
+		wantParams     int
+		wantData       int
+		fragmentsRead  int
+		emptyFragments int
+	)
+
+	for {
+		resp, err := c.awaitResponse(respCh, mid, ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		frag, err := smb1.DecodeTrans2Response(resp.params, resp.data)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// An error status ends the transaction; there is nothing further to
+		// reassemble. Hand the message back so the caller can apply its own
+		// error/warning policy.
+		if resp.err != nil && resp.header.IsError() {
+			return resp, frag, nil
+		}
+
+		if first == nil {
+			first = resp
+			assembled = frag
+			wantParams = int(frag.TotalParameterCount)
+			wantData = int(frag.TotalDataCount)
+			paramBuf = make([]byte, wantParams)
+			dataBuf = make([]byte, wantData)
+		}
+
+		if err := placeFragment(paramBuf, frag.Parameters, frag.ParameterDisplacement, "parameter"); err != nil {
+			return nil, nil, err
+		}
+		if err := placeFragment(dataBuf, frag.Data, frag.DataDisplacement, "data"); err != nil {
+			return nil, nil, err
+		}
+		gotParams += len(frag.Parameters)
+		gotData += len(frag.Data)
+
+		if gotParams >= wantParams && gotData >= wantData {
+			break
+		}
+
+		// Guard against a server that keeps sending messages contributing
+		// nothing, which would otherwise spin here until the context expires.
+		if len(frag.Parameters) == 0 && len(frag.Data) == 0 {
+			emptyFragments++
+			if emptyFragments > 1 {
+				return nil, nil, fmt.Errorf("smb1: trans2 response stalled at %d/%d parameter and %d/%d data bytes",
+					gotParams, wantParams, gotData, wantData)
+			}
+		}
+
+		fragmentsRead++
+		if fragmentsRead > maxTrans2Fragments {
+			return nil, nil, fmt.Errorf("smb1: trans2 response split across more than %d messages", maxTrans2Fragments)
+		}
+		logger.Debug("sendRecvTransaction: MID %d reassembling, have %d/%d parameter and %d/%d data bytes",
+			mid, gotParams, wantParams, gotData, wantData)
+	}
+
+	assembled.Parameters = paramBuf
+	assembled.Data = dataBuf
+	assembled.ParameterCount = uint16(wantParams)
+	assembled.DataCount = uint16(wantData)
+
+	return first, assembled, nil
+}
+
+// placeFragment copies one message's slice of a TRANS2 reply into the
+// reassembly buffer at the displacement the server reported.
+func placeFragment(buf, frag []byte, displacement uint16, what string) error {
+	if len(frag) == 0 {
+		return nil
+	}
+	start := int(displacement)
+	if start < 0 || start+len(frag) > len(buf) {
+		return fmt.Errorf("smb1: trans2 %s fragment at offset %d length %d overflows the %d-byte reply",
+			what, start, len(frag), len(buf))
+	}
+	copy(buf[start:], frag)
+	return nil
+}
+
+// beginRequest allocates a MID, registers the request as pending and sends it.
+// The returned channel carries every message the server sends for that MID;
+// cleanup unregisters it and must be called once the caller is done reading.
+func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx context.Context) (<-chan *response, uint16, func(), error) {
+	logger := logging.FromContext(ctx)
+
+	c.mu.Lock()
+
+	select {
+	case <-c.done:
+		c.mu.Unlock()
+		return nil, 0, nil, c.err
+	default:
+	}
+
+	mid, err := c.allocateMID()
+	if err != nil {
+		c.mu.Unlock()
+		return nil, 0, nil, err
+	}
+	header.MID = mid
+	respCh := make(chan *response, responseQueueDepth)
+	c.pending[mid] = &pendingRequest{respCh: respCh, cancelled: false}
+	c.mu.Unlock()
+
+	cleanup := func() {
+		c.mu.Lock()
+		delete(c.pending, mid)
+		c.mu.Unlock()
+	}
+
+	logger.Debug("sendRecv: sending SMB command 0x%02X with MID %d", header.Command, mid)
+
+	packet, err := smb1.EncodePacket(header, params, data)
+	if err != nil {
+		cleanup()
+		return nil, 0, nil, fmt.Errorf("smb1: failed to encode packet: %w", err)
+	}
+
+	if err := c.netbiosConn.WritePacketContext(ctx, packet); err != nil {
+		cleanup()
+		c.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		return nil, 0, nil, err
+	}
+
+	return respCh, mid, cleanup, nil
 }
 
 // Receive is the background goroutine that reads responses and dispatches them to waiters.

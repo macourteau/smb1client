@@ -452,9 +452,14 @@ func DecodeFindFirst2Response(params, data []byte, infoLevel uint16) (*FindFirst
 		}
 		resp.Files = result.Files
 
-		// If parsing was truncated, the response was incomplete due to size limits.
-		// With the reduced batch size (100 entries), this should rarely happen.
-		// If it does, we may lose files since the server likely closed the search (EndOfSearch=1).
+		// A truncated parse means the reply's own bytes ended mid-entry. The
+		// transport reassembles replies the server splits across messages, so
+		// reaching here means the data is malformed. Returning the short list
+		// would drop directory entries with nothing to tell the caller apart
+		// from a genuinely small directory.
+		if result.Truncated {
+			return nil, fmt.Errorf("smb1: find first2 response truncated after %d entries", len(result.Files))
+		}
 	}
 
 	return resp, nil
@@ -518,8 +523,11 @@ func DecodeFindNext2Response(params, data []byte, infoLevel uint16) (*FindNext2R
 		}
 		resp.Files = result.Files
 
-		// If parsing was truncated, the response was incomplete due to size limits.
-		// With the reduced batch size (100 entries), this should rarely happen.
+		// See DecodeFindFirst2Response: a truncated parse is malformed data,
+		// not a size limit, and must not be reported as a short listing.
+		if result.Truncated {
+			return nil, fmt.Errorf("smb1: find next2 response truncated after %d entries", len(result.Files))
+		}
 	}
 
 	return resp, nil
@@ -642,8 +650,11 @@ func ParseFileBothDirectoryInfo(data []byte) (*ParseFileBothDirectoryInfoResult,
 	offset := 0
 
 	for offset < len(data) {
-		// Need at least 94 bytes for the fixed part of the structure
+		// Need at least 94 bytes for the fixed part of the structure. Fewer
+		// than that left means the previous entry chained to an entry the
+		// reply does not actually carry, so the data is short.
 		if len(data)-offset < 94 {
+			result.Truncated = true
 			break
 		}
 
