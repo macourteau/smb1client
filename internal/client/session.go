@@ -343,7 +343,7 @@ func (t *Tree) SendTransact2(subcommand uint16, params, data []byte, ctx context
 	header.UID = t.Session.uid
 	header.TID = t.TID
 
-	resp, err := t.Session.conn.sendRecv(header, allParams, dataBytes, ctx)
+	resp, trans2Resp, err := t.Session.conn.sendRecvTransaction(header, allParams, dataBytes, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -352,12 +352,6 @@ func (t *Tree) SendTransact2(subcommand uint16, params, data []byte, ctx context
 	// (e.g., STATUS_NO_MORE_FILES). We only fail on actual errors.
 	if resp.err != nil && resp.header.IsError() {
 		return nil, resp.err
-	}
-
-	// Decode TRANS2 response
-	trans2Resp, err := smb1.DecodeTrans2Response(resp.params, resp.data)
-	if err != nil {
-		return nil, err
 	}
 
 	// If there was a warning status, preserve it in the response
@@ -489,7 +483,7 @@ func (t *Tree) SendTransaction(name string, params, data []byte, ctx context.Con
 	header.UID = t.Session.uid
 	header.TID = t.TID
 
-	resp, err := t.Session.conn.sendRecv(header, allParams, dataBytes, ctx)
+	resp, transResp, err := t.Session.conn.sendRecvTransaction(header, allParams, dataBytes, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -497,12 +491,6 @@ func (t *Tree) SendTransaction(name string, params, data []byte, ctx context.Con
 	// Check for errors (but allow warnings like TRANS2)
 	if resp.err != nil && resp.header.IsError() {
 		return nil, resp.err
-	}
-
-	// Decode TRANSACTION response (same format as TRANS2)
-	transResp, err := smb1.DecodeTransactionResponse(resp.params, resp.data)
-	if err != nil {
-		return nil, err
 	}
 
 	// Preserve warning status if present

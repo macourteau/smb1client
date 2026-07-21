@@ -1354,13 +1354,9 @@ func (f *File) TransactNamedPipe(data []byte, ctx context.Context) ([]byte, erro
 	header.UID = f.session.uid
 	header.TID = f.tid
 
-	resp, err := f.session.conn.sendRecv(header, allParams, dataBytes, ctx)
+	resp, transResp, err := f.session.conn.sendRecvTransaction(header, allParams, dataBytes, ctx)
 	if err == nil && resp.err == nil {
 		// Success with TransactNamedPipe function
-		transResp, err := smb1.DecodeTransactionResponse(resp.params, resp.data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode TransactNamedPipe response: %w", err)
-		}
 		logger.Debug("TransactNamedPipe: received %d bytes from pipe FID=%d", len(transResp.Data), f.fid)
 		return transResp.Data, nil
 	}
