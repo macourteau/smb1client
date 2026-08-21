@@ -681,6 +681,10 @@ type ParseFileBothDirectoryInfoResult struct {
 	Truncated bool                    // True if parsing stopped due to truncated data
 }
 
+// fileBothDirectoryInfoFixedSize is the size of a FileBothDirectoryInfo entry
+// up to but excluding its variable-length file name.
+const fileBothDirectoryInfoFixedSize = 94
+
 // ParseFileBothDirectoryInfo parses a sequence of FileBothDirectoryInfo structures.
 // These structures are chained using NextEntryOffset.
 // Returns a result containing the parsed files and a truncation flag.
@@ -692,10 +696,11 @@ func ParseFileBothDirectoryInfo(data []byte) (*ParseFileBothDirectoryInfoResult,
 	offset := 0
 
 	for offset < len(data) {
-		// Need at least 94 bytes for the fixed part of the structure. Fewer
-		// than that left means the previous entry chained to an entry the
-		// reply does not actually carry, so the data is short.
-		if len(data)-offset < 94 {
+		// Need at least fileBothDirectoryInfoFixedSize bytes for the fixed part
+		// of the structure. Fewer than that left means the previous entry
+		// chained to an entry the reply does not actually carry, so the data is
+		// short.
+		if len(data)-offset < fileBothDirectoryInfoFixedSize {
 			result.Truncated = true
 			break
 		}
@@ -718,7 +723,7 @@ func ParseFileBothDirectoryInfo(data []byte) (*ParseFileBothDirectoryInfoResult,
 		copy(file.ShortName[:], data[offset+70:offset+94])
 
 		// Parse file name (Unicode)
-		nameStart := offset + 94
+		nameStart := offset + fileBothDirectoryInfoFixedSize
 		nameEnd := nameStart + int(file.FileNameLength)
 		if nameEnd > len(data) {
 			// Filename extends beyond available data - this means the response was truncated.
@@ -734,11 +739,26 @@ func ParseFileBothDirectoryInfo(data []byte) (*ParseFileBothDirectoryInfoResult,
 
 		result.Files = append(result.Files, file)
 
-		// Move to next entry
+		// Move to next entry. A zero offset terminates the chain; servers that
+		// do not zero-terminate leave the last offset pointing past the reply
+		// and rely on the data length instead, so both must be honoured.
+		//
+		// The arithmetic is done in int64 deliberately. NextEntryOffset is a
+		// uint32 straight off the wire, and widening it to int would go
+		// negative on a 32-bit build, walking the offset backwards.
 		if file.NextEntryOffset == 0 {
 			break // Last entry
 		}
-		offset += int(file.NextEntryOffset)
+		next := int64(file.NextEntryOffset)
+		if next < int64(fileBothDirectoryInfoFixedSize)+int64(file.FileNameLength) {
+			// Chains into the entry just parsed, so the reply is malformed.
+			result.Truncated = true
+			break
+		}
+		if int64(offset)+next >= int64(len(data)) {
+			break // Chains past the reply: the data length ends the walk
+		}
+		offset += int(next)
 	}
 
 	return result, nil
