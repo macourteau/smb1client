@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/macourteau/smb1client/internal/erref"
 	"github.com/macourteau/smb1client/internal/logging"
@@ -30,6 +31,16 @@ import (
 // within the negotiated MaxBufferSize, ensuring protocol messages don't
 // exceed the server's buffer limits.
 const SMBProtocolOverhead = 1024
+
+// writeDrainTimeout bounds how long a cancelled write waits for the chunks it
+// has already handed to the transport.
+//
+// Those chunks are on the wire and the server will apply them whatever the
+// caller does, so their outcomes are what make the returned byte count
+// truthful. Returning the moment the context fires reports a count lower than
+// what the file actually holds — often zero while megabytes land — and a
+// caller that resumes from it rewrites a range that is already there.
+const writeDrainTimeout = 30 * time.Second
 
 // File represents an open file on the SMB share.
 type File struct {
@@ -671,16 +682,29 @@ func (f *File) writeSequential(data []byte, offset int64, ctx context.Context) (
 		}
 	}
 
+	// Cancellation is honoured between chunks rather than inside one. A chunk
+	// already dispatched is waited out under a bounded deadline so its bytes
+	// are counted: the server applies it either way, and dropping it on the
+	// floor would under-report what the file holds. See writeDrainTimeout.
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), writeDrainTimeout)
+	defer cancelSettle()
+
 	totalWritten := 0
 
 	for totalWritten < len(data) {
+		select {
+		case <-ctx.Done():
+			return totalWritten, ctx.Err()
+		default:
+		}
+
 		remaining := len(data) - totalWritten
 		chunkSize := remaining
 		if chunkSize > maxDataPerWrite {
 			chunkSize = maxDataPerWrite
 		}
 
-		n, err := f.WriteAt(data[totalWritten:totalWritten+chunkSize], offset+int64(totalWritten), ctx)
+		n, err := f.WriteAt(data[totalWritten:totalWritten+chunkSize], offset+int64(totalWritten), settleCtx)
 		totalWritten += n
 
 		if err != nil {
@@ -754,21 +778,13 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		sent++
 	}
 
-	if sendErr != nil {
-		// Mark any successfully allocated MIDs as cancelled
-		f.session.conn.mu.Lock()
-		for i := 0; i < sent; i++ {
-			if req, ok := f.session.conn.pending[chunks[i].mid]; ok {
-				req.cancelled = true
-			}
-		}
-		f.session.conn.mu.Unlock()
-		return 0, sendErr
-	}
+	// A failure part way through the initial batch is not a reason to report
+	// zero: the requests that did go out will be applied by the server. Fall
+	// through and settle them, then report sendErr with an accurate count.
 
 	// Process responses and send remaining requests
 	totalWritten := 0
-	nextToSend := maxPipeline
+	nextToSend := sent
 
 	// Helper function to mark pending requests as cancelled.
 	// The Receive() goroutine will check this flag and skip sending responses.
@@ -783,6 +799,61 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		f.session.conn.mu.Unlock()
 	}
 
+	// draining records that no further chunks will be dispatched, either
+	// because the caller gave up or because a send failed. The chunks already
+	// on the wire are still waited for under the bounded deadline abortCh
+	// carries, since the server applies them either way and their outcomes are
+	// what make the returned count truthful. See writeDrainTimeout.
+	draining := false
+	var abortCh <-chan time.Time
+	var deferredErr error
+
+	stopFeeding := func(cause error) {
+		if draining {
+			return
+		}
+		draining = true
+		abortCh = time.After(writeDrainTimeout)
+		// A send that failed only because the caller gave up is reported as the
+		// cancellation it was, so callers can classify it the usual way rather
+		// than through whichever layer noticed first.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			cause = ctxErr
+		}
+		deferredErr = cause
+		logger.Debug("writePipelined: no longer feeding the pipeline (%v), draining chunks already sent", cause)
+	}
+
+	if sendErr != nil {
+		stopFeeding(sendErr)
+	}
+
+	// awaitChunk waits for one chunk's response. While the write is still live
+	// it waits as long as the transport allows, which is what an uncancelled
+	// write needs; once draining it keeps waiting, but not forever.
+	awaitChunk := func(chunk *writeChunk) (*response, error) {
+		for {
+			// A nil channel blocks forever, which is how each phase disables
+			// the case belonging to the other.
+			var ctxDone <-chan struct{}
+			if !draining {
+				ctxDone = ctx.Done()
+			}
+
+			select {
+			case resp := <-chunk.respCh:
+				return resp, nil
+			case <-ctxDone:
+				stopFeeding(ctx.Err())
+			case <-abortCh:
+				logger.Warn("writePipelined: gave up draining after %s with %d bytes confirmed", writeDrainTimeout, totalWritten)
+				return nil, deferredErr
+			case <-f.session.conn.done:
+				return nil, f.session.conn.connError()
+			}
+		}
+	}
+
 	for i := 0; i < numChunks; i++ {
 		// Only process chunks that were actually sent
 		// Chunks 0..sent-1 were sent in initial batch
@@ -794,28 +865,16 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 
 		chunk := chunks[i]
 
-		// Wait for this chunk's response
-		var resp *response
-		select {
-		case resp = <-chunk.respCh:
-			// Cleanup this MID
-			f.session.conn.mu.Lock()
-			delete(f.session.conn.pending, chunk.mid)
-			f.session.conn.mu.Unlock()
-		case <-ctx.Done():
-			// Mark current chunk and all pending requests as cancelled
-			f.session.conn.mu.Lock()
-			if req, ok := f.session.conn.pending[chunk.mid]; ok {
-				req.cancelled = true
-			}
-			f.session.conn.mu.Unlock()
-			cleanupPending(i+1, nextToSend)
-			return totalWritten, ctx.Err()
-		case <-f.session.conn.done:
-			// Connection closed - setError() or Close() will clean up all pending MIDs
-			// including the current chunk, so no explicit cleanup needed here
-			return totalWritten, f.session.conn.connError()
+		resp, err := awaitChunk(chunk)
+		if err != nil {
+			cleanupPending(i, nextToSend)
+			return totalWritten, err
 		}
+
+		// Cleanup this MID
+		f.session.conn.mu.Lock()
+		delete(f.session.conn.pending, chunk.mid)
+		f.session.conn.mu.Unlock()
 
 		// Handle response error
 		if resp.err != nil {
@@ -825,11 +884,11 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		}
 
 		// Decode response
-		writeResp, err := smb1.DecodeWriteResponse(resp.params, resp.data)
-		if err != nil {
+		writeResp, decodeErr := smb1.DecodeWriteResponse(resp.params, resp.data)
+		if decodeErr != nil {
 			// Clean up remaining pending requests
 			cleanupPending(i+1, nextToSend)
-			return totalWritten, fmt.Errorf("smb1: failed to decode write response: %w", err)
+			return totalWritten, fmt.Errorf("smb1: failed to decode write response: %w", decodeErr)
 		}
 
 		// Check bytes written
@@ -843,18 +902,31 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 			return totalWritten, io.ErrShortWrite
 		}
 
-		// Send next request if any remain
-		if nextToSend < numChunks {
-			if err := f.sendWriteRequest(chunks[nextToSend], ctx); err != nil {
-				// Clean up remaining pending requests (including the one we just failed to send)
-				cleanupPending(i+1, nextToSend)
-				return totalWritten, err
+		// Check for cancellation explicitly. Responses that are already
+		// buffered are handed over without awaitChunk ever reaching its select,
+		// so a fast pipeline could otherwise keep feeding itself past the point
+		// where the caller gave up.
+		if !draining {
+			select {
+			case <-ctx.Done():
+				stopFeeding(ctx.Err())
+			default:
 			}
-			nextToSend++
+		}
+
+		// Send next request if any remain, but only while the write is live.
+		if !draining && nextToSend < numChunks {
+			if err := f.sendWriteRequest(chunks[nextToSend], ctx); err != nil {
+				// The send failed, but everything already dispatched still
+				// counts, so drain rather than abandoning it.
+				stopFeeding(err)
+			} else {
+				nextToSend++
+			}
 		}
 	}
 
-	return totalWritten, nil
+	return totalWritten, deferredErr
 }
 
 // sendWriteRequest sends a single pipelined write request

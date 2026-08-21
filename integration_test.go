@@ -5,6 +5,7 @@ package smb1_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -1169,6 +1170,87 @@ func TestDir_RemoveAfterListingLargeDirectory(t *testing.T) {
 			}
 			if exists {
 				t.Errorf("directory %q still exists after RemoveAll", dir)
+			}
+		})
+	}
+}
+
+// TestFile_WriteReportsAccurateCountWhenCancelled covers the byte count a
+// cancelled write returns.
+//
+// A write keeps chunks in flight. Cancelling used to return as soon as the
+// context fired, counting only what had been confirmed by then, so the call
+// reported far less than the file actually held — often zero while megabytes
+// landed. A caller sizing a retry or a resume from that count rewrites a range
+// that is already there.
+//
+// The sizes straddle the pipelining threshold so both write paths are covered.
+func TestFile_WriteReportsAccurateCountWhenCancelled(t *testing.T) {
+	session, cleanupSession := createTestSession(t)
+	defer cleanupSession()
+
+	share, cleanupShare := mountTestShare(t, session)
+	defer cleanupShare()
+
+	// Position-encoded, so a byte-range gap reads back as zeros and a
+	// reordered chunk reads back as the wrong offset.
+	payload := make([]byte, 16<<20)
+	for i := range payload {
+		payload[i] = byte(i>>16) ^ byte(i>>8) ^ byte(i) ^ 0xA5
+	}
+
+	for _, tc := range []struct {
+		name  string
+		size  int
+		delay time.Duration
+	}{
+		{name: "sequential", size: 200 << 10, delay: 2 * time.Millisecond},
+		{name: "pipelined", size: len(payload), delay: 25 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := testFileName("cancelwrite_" + tc.name)
+			defer share.Remove(name)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			f, err := share.WithContext(ctx).Create(name)
+			if err != nil {
+				t.Fatalf("Create(%q) failed: %v", name, err)
+			}
+
+			go func() {
+				time.Sleep(tc.delay)
+				cancel()
+			}()
+
+			n, writeErr := f.Write(payload[:tc.size])
+			f.Close()
+
+			if writeErr != nil && !errors.Is(writeErr, context.Canceled) {
+				t.Fatalf("Write() error = %v, want nil or a wrapped context.Canceled", writeErr)
+			}
+			if n < 0 || n > tc.size {
+				t.Fatalf("Write() returned n = %d, outside 0..%d", n, tc.size)
+			}
+
+			// Read back on a fresh session so no client-side bookkeeping or
+			// stale handle can colour the answer.
+			verifySession, cleanupVerify := createTestSession(t)
+			defer cleanupVerify()
+			verifyShare, cleanupVerifyShare := mountTestShare(t, verifySession)
+			defer cleanupVerifyShare()
+
+			onDisk, err := verifyShare.ReadFile(name)
+			if err != nil {
+				t.Fatalf("ReadFile(%q) failed: %v", name, err)
+			}
+
+			if len(onDisk) != n {
+				t.Errorf("Write() reported %d bytes, but the file holds %d", n, len(onDisk))
+			}
+			if n > 0 && !bytes.Equal(onDisk[:min(n, len(onDisk))], payload[:min(n, len(onDisk))]) {
+				t.Errorf("the first %d bytes on the server do not match what was written", n)
 			}
 		})
 	}
