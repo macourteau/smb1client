@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -529,5 +531,64 @@ func TestAllocateMIDExhaustionTerminates(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("allocateMID() did not terminate with every ID taken")
+	}
+}
+
+// recordingLogger captures what the receive loop reports.
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLogger) record(level, format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, level+" "+fmt.Sprintf(format, v...))
+}
+
+func (l *recordingLogger) Debug(format string, v ...interface{}) { l.record("DEBUG", format, v...) }
+func (l *recordingLogger) Info(format string, v ...interface{})  { l.record("INFO", format, v...) }
+func (l *recordingLogger) Warn(format string, v ...interface{})  { l.record("WARN", format, v...) }
+func (l *recordingLogger) Error(format string, v ...interface{}) { l.record("ERROR", format, v...) }
+
+func (l *recordingLogger) matching(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// TestReceiveLogsResponseForUnknownMID covers the one discard path in the
+// receive loop that used to leave no trace. It is usually a late reply to an
+// abandoned request, but it is also where a duplicate reply or an answer to an
+// ID that was never issued would arrive, and those need to be diagnosable.
+func TestReceiveLogsResponseForUnknownMID(t *testing.T) {
+	logger := &recordingLogger{}
+	mockTCP := newMockConn()
+	c := NewConn(mockTCP, WithConnLogger(logger))
+	defer c.Close()
+
+	go c.Receive()
+
+	// A well-formed ECHO reply for a MID nothing is waiting on.
+	header := smb1.NewHeader(smb1.SMB_COM_ECHO)
+	header.MID = 4242
+	go mockTCP.addResponse(header, nil, nil)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if len(logger.matching("unknown MID 4242")) > 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("receive loop discarded a response for an unknown MID without logging it; saw %v", logger.lines)
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
