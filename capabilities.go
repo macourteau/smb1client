@@ -18,10 +18,14 @@ type ServerCapabilities struct {
 	// server can receive. This limits the size of individual read/write requests.
 	MaxBufferSize uint32
 
-	// ServerName is the NetBIOS name of the server.
+	// ServerName is the NetBIOS name of the server. It is empty against a
+	// server that negotiates extended security, which sends a GUID and a
+	// security blob in place of the names.
 	ServerName string
 
-	// DomainName is the domain or workgroup name the server belongs to.
+	// DomainName is the domain or workgroup name the server belongs to. It is
+	// empty against a server that negotiates extended security, for the same
+	// reason as ServerName.
 	DomainName string
 
 	// SupportsPipelining indicates whether the server supports concurrent
