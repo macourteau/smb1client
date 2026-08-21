@@ -244,6 +244,11 @@ func TestFileRead(t *testing.T) {
 
 	getMockConn(tree.Session.conn).addResponse(respHeader, respParams, respData)
 
+	// A reply shorter than the request does not end the file on its own; the
+	// empty reply that follows does.
+	time.Sleep(10 * time.Millisecond)
+	readAtResponse(tree, 1, nil)
+
 	// Wait for read to complete
 	select {
 	case <-done:
@@ -704,6 +709,10 @@ func TestFileReadChunkingEOF(t *testing.T) {
 
 		getMockConn(tree.Session.conn).addResponse(respHeader, respParams, respData)
 	}
+
+	// The partial chunk only hints at the end; the empty reply confirms it.
+	time.Sleep(10 * time.Millisecond)
+	readAtResponse(tree, 2, nil)
 
 	// Wait for read to complete
 	select {

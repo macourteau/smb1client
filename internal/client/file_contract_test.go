@@ -839,8 +839,10 @@ func readAtResponse(tree *Tree, mid uint16, payload []byte) {
 }
 
 // TestFileReadAtShortRead is a regression test for the io.ReaderAt contract:
-// a read that returns fewer bytes than requested (only possible at end of
-// file) must return the data together with io.EOF, not a nil error.
+// a read that returns fewer bytes than requested must return the data
+// together with io.EOF, not a nil error. Reaching end of file takes one more
+// round trip than the short reply that hints at it, because only an empty
+// reply proves the file ended.
 func TestFileReadAtShortRead(t *testing.T) {
 	tree := setupTestTree()
 	defer tree.Session.conn.Close()
@@ -868,6 +870,10 @@ func TestFileReadAtShortRead(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 	readAtResponse(tree, 0, []byte("hello"))
+
+	// The short reply alone does not end the file; the empty reply does.
+	time.Sleep(10 * time.Millisecond)
+	readAtResponse(tree, 1, nil)
 
 	select {
 	case <-done:
@@ -1023,4 +1029,104 @@ func TestBaseName(t *testing.T) {
 			t.Errorf("baseName(%q) = %q, want %q", tt.path, got, tt.want)
 		}
 	}
+}
+
+// cappedReadResponder answers READ_ANDX from a synthetic file of fileSize
+// bytes, serving at most readCap bytes per reply. It models a server that
+// bounds a read reply below what the client asked for — Windows 11 caps a
+// READ_ANDX reply at 65536 bytes however much more is requested — so a short
+// reply arrives with plenty of file left.
+func cappedReadResponder(fileSize int, readCap int) func(SMBRequest) (*smb1.Header, []byte, []byte) {
+	return func(req SMBRequest) (*smb1.Header, []byte, []byte) {
+		if req.Command != smb1.SMB_COM_READ_ANDX {
+			return nil, nil, nil
+		}
+		serve := int(req.ReadLength)
+		if serve > readCap {
+			serve = readCap
+		}
+		if left := fileSize - int(req.ReadOffset); serve > left {
+			serve = left
+		}
+		if serve < 0 {
+			serve = 0
+		}
+		data := make([]byte, serve)
+		for i := range data {
+			data[i] = byte((req.ReadOffset + uint64(i)) % 251)
+		}
+		return CreateReadResponse(req.MID, data)
+	}
+}
+
+// setupCappedReadFile wires a File to a mock server that caps read replies.
+func setupCappedReadFile(t *testing.T, fileSize, readCap int) (*File, *EnhancedMockConn, func()) {
+	t.Helper()
+	mock := newEnhancedMockConn()
+	conn := NewConn(mock)
+	conn.maxBufferSize = 4356
+	conn.maxMpxCount = 50
+	conn.capabilities = smb1.CAP_LARGE_FILES | smb1.CAP_LARGE_READX
+	mock.SetAutoResponder(cappedReadResponder(fileSize, readCap))
+	go conn.Receive()
+
+	session := &Session{conn: conn, uid: 100, initiator: newMockInitiator(), trees: make(map[uint16]*Tree)}
+	f := &File{session: session, tid: 200, fid: 0x002A, name: "capped.bin"}
+	return f, mock, func() { conn.Close() }
+}
+
+// TestFileReadAtShortResponseIsNotEOF is a regression test for a silent
+// truncation on the io.ReaderAt surface: a READ_ANDX reply shorter than the
+// request was reported as io.EOF, though a server may serve fewer bytes than
+// asked for reasons unrelated to end of file. Only an empty reply (or
+// STATUS_END_OF_FILE) ends the file.
+func TestFileReadAtShortResponseIsNotEOF(t *testing.T) {
+	const fileSize = 20000
+	const readCap = 4096
+
+	f, mock, cleanup := setupCappedReadFile(t, fileSize, readCap)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	t.Run("fills the buffer across short replies", func(t *testing.T) {
+		buf := make([]byte, fileSize)
+		n, err := f.ReadAt(buf, 0, ctx)
+		if err != nil {
+			t.Errorf("ReadAt: got error %v, want nil", err)
+		}
+		if n != fileSize {
+			t.Errorf("bytes read: got %d, want %d", n, fileSize)
+		}
+		for i := 0; i < n; i++ {
+			if buf[i] != byte(i%251) {
+				t.Fatalf("data mismatch at %d: got %d, want %d", i, buf[i], byte(i%251))
+			}
+		}
+		if got := len(mock.GetRequestsByCommand(smb1.SMB_COM_READ_ANDX)); got < 2 {
+			t.Errorf("READ_ANDX requests: got %d, want the short replies to be re-issued", got)
+		}
+	})
+
+	t.Run("reports io.EOF once a reply is empty", func(t *testing.T) {
+		buf := make([]byte, 5000)
+		n, err := f.ReadAt(buf, fileSize-2000, ctx)
+		if err != io.EOF {
+			t.Errorf("ReadAt past end: got error %v, want io.EOF", err)
+		}
+		if n != 2000 {
+			t.Errorf("bytes read: got %d, want 2000", n)
+		}
+	})
+
+	t.Run("reads at end of file report io.EOF with no data", func(t *testing.T) {
+		buf := make([]byte, 100)
+		n, err := f.ReadAt(buf, fileSize, ctx)
+		if err != io.EOF {
+			t.Errorf("ReadAt at end: got error %v, want io.EOF", err)
+		}
+		if n != 0 {
+			t.Errorf("bytes read: got %d, want 0", n)
+		}
+	})
 }

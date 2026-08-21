@@ -62,10 +62,11 @@ const maxPipelineDepth = 50
 // still answers a 64 KiB read in full. A server that lacks the capability has
 // no such licence, so there the buffer is the bound.
 //
-// The ceiling stays at the 16-bit limit rather than the larger write ceiling:
-// asked for more than 64 KiB in one read, a server may answer with less, and a
-// short chunk ends the transfer early because nothing distinguishes it from end
-// of file.
+// The ceiling stays at the 16-bit limit rather than the larger write ceiling
+// because a server may answer a larger read with less: Windows 11 caps a read
+// reply at 65536 bytes however much more is asked, while accepting twice that
+// on a write. ReadAt copes by asking again, but a short chunk still cuts a
+// pipelined read short, so the requests stay under the smallest cap observed.
 func (f *File) maxReadChunk() int {
 	if f.session.conn.capabilities&smb1.CAP_LARGE_READX != 0 {
 		return smb1.MaxSmallDataSize
@@ -459,7 +460,11 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		n := copy(buf[chunk.bufOffset:chunk.bufOffset+chunk.size], readResp.Data)
 		totalRead += n
 
-		// If we got less than requested, we've reached EOF
+		// A short chunk ends this call. Unlike ReadAt, the pipeline cannot
+		// ask again for the remainder here: the chunks that follow are
+		// already in flight at later offsets, so a re-issue would leave a
+		// hole. The io.Reader contract permits a short read, so the caller
+		// resumes from the advanced offset.
 		if n < chunk.size {
 			// Clean up remaining pending requests
 			cleanupPending(i+1, nextToSend)
@@ -586,9 +591,14 @@ func (f *File) ReadAt(buf []byte, offset int64, ctx context.Context) (int, error
 }
 
 // readAtChunk issues a single READ_ANDX for up to maxDataPerRead bytes at the
-// given offset. A response shorter than the request is reported as io.EOF:
-// requests never exceed what the server negotiated, so a short response only
-// happens at end of file.
+// given offset.
+//
+// A reply shorter than the request does not mean end of file. A server may
+// serve fewer bytes than asked for reasons of its own: Windows 11 caps a read
+// reply at 65536 bytes however much more is requested, while accepting twice
+// that on a write. Only an empty reply, or STATUS_END_OF_FILE, ends the file,
+// so a short but non-empty reply carries a nil error and ReadAt asks again for
+// the remainder.
 func (f *File) readAtChunk(buf []byte, offset int64, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
 
@@ -650,8 +660,8 @@ func (f *File) readAtChunk(buf []byte, offset int64, ctx context.Context) (int, 
 	// Copy data to buffer
 	n := copy(buf, readResp.Data)
 
-	if n < readSize {
-		return n, io.EOF
+	if n == 0 {
+		return 0, io.EOF
 	}
 
 	return n, nil
