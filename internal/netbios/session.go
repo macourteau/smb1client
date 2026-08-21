@@ -69,10 +69,17 @@ const (
 // The length field is 17 bits, allowing for 2^17 = 131,072 bytes.
 const MaxMessageSize = 131072
 
-// ReadTimeout is the maximum time to wait for message data after reading the header.
-// This prevents memory exhaustion attacks where a malicious server sends a valid
-// length in the header but never sends the actual data, causing allocated memory
-// to be held indefinitely. 30 seconds should be sufficient even for slow networks.
+// ReadTimeout is the maximum time to wait for message data once a header has
+// announced it. This prevents memory exhaustion attacks where a malicious
+// server sends a valid length in the header but never sends the actual data,
+// causing allocated memory to be held indefinitely. 30 seconds should be
+// sufficient even for slow networks.
+//
+// It deliberately does not cover the header read. The receive loop spends all
+// of an idle connection's life blocked there, so a deadline armed before the
+// header would fail a connection for being idle — which is not what this
+// timeout is for, and is at odds with the connection pool holding sessions
+// idle for minutes.
 const ReadTimeout = 30 * time.Second
 
 // Session wraps a TCP connection and provides NetBIOS session service framing.
@@ -122,17 +129,13 @@ func (s *Session) ReadPacketContext(ctx context.Context) ([]byte, error) {
 	default:
 	}
 
-	// Set read deadline for the entire packet read (header + data) to prevent
-	// memory exhaustion attacks. A malicious server could send a valid length
-	// in the header but never send the actual data, causing allocated memory
-	// to be held indefinitely. The deadline is cleared after reading completes.
-	if err := s.conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
-		logger.Debug("netbios: failed to set read deadline: %v", err)
-		return nil, fmt.Errorf("netbios: failed to set read deadline: %w", err)
+	// No deadline covers the header read. An idle connection sits blocked here
+	// with nothing outstanding, and failing it for that would break connection
+	// reuse; the peer going away is reported by the read itself.
+	if err := s.conn.SetReadDeadline(time.Time{}); err != nil {
+		logger.Debug("netbios: failed to clear read deadline: %v", err)
+		return nil, fmt.Errorf("netbios: failed to clear read deadline: %w", err)
 	}
-	defer func() {
-		s.conn.SetReadDeadline(time.Time{})
-	}()
 
 	if _, err := io.ReadFull(s.conn, header); err != nil {
 		if isHangup(err) {
@@ -192,6 +195,17 @@ func (s *Session) ReadPacketContext(ctx context.Context) ([]byte, error) {
 		return nil, ctx.Err()
 	default:
 	}
+
+	// A header has announced this payload, so from here a silent server is
+	// holding an allocation open: that is what ReadTimeout guards, and this is
+	// the only place it applies.
+	if err := s.conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+		logger.Debug("netbios: failed to set read deadline: %v", err)
+		return nil, fmt.Errorf("netbios: failed to set read deadline: %w", err)
+	}
+	defer func() {
+		s.conn.SetReadDeadline(time.Time{})
+	}()
 
 	// Read the message data
 	data := make([]byte, length)
