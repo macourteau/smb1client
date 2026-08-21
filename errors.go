@@ -154,6 +154,15 @@ func wrapError(err error) error {
 // *AuthenticationError wrapping it unless Dialer.AllowGuest is set.
 var ErrGuestLogon = smb1.ErrGuestLogon
 
+// ErrShareLevelSecurity reports that the server authenticates per share rather
+// than per user, which this client does not implement.
+var ErrShareLevelSecurity = smb1.ErrShareLevelSecurity
+
+// ErrSigningRequired reports that the server requires SMB signing, which this
+// client does not implement. Note that a server can require signing without
+// advertising it, so a session can still fail later for this reason.
+var ErrSigningRequired = smb1.ErrSigningRequired
+
 // AuthenticationError represents authentication failures.
 // This provides more context about why authentication failed.
 type AuthenticationError struct {
