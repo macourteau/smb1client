@@ -53,6 +53,48 @@ const maxPipelineDepth = 50
 // capability report says cannot drift apart. A server advertising 0 or 1 gets
 // one request at a time, which is the same thing said twice: no pipelining, and
 // a depth of one.
+// maxReadChunk returns the largest READ_ANDX payload this connection may ask
+// for in one request.
+//
+// CAP_LARGE_READX raises the ceiling above the negotiated buffer: the buffer
+// bounds an ordinary SMB message, and the capability exists precisely to let a
+// read response exceed it. A server negotiating the 4356-byte SMB1 minimum
+// still answers a 64 KiB read in full. A server that lacks the capability has
+// no such licence, so there the buffer is the bound.
+//
+// The ceiling stays at the 16-bit limit rather than the larger write ceiling:
+// asked for more than 64 KiB in one read, a server may answer with less, and a
+// short chunk ends the transfer early because nothing distinguishes it from end
+// of file.
+func (f *File) maxReadChunk() int {
+	if f.session.conn.capabilities&smb1.CAP_LARGE_READX != 0 {
+		return smb1.MaxSmallDataSize
+	}
+	return clampToNegotiatedBuffer(smb1.MaxSmallDataSize, f.session.conn.maxBufferSize)
+}
+
+// maxWriteChunk returns the largest WRITE_ANDX payload this connection may send
+// in one request. CAP_LARGE_WRITEX lifts the same bound CAP_LARGE_READX lifts
+// for reads, so the negotiated buffer constrains only a server that did not
+// advertise it.
+func (f *File) maxWriteChunk() int {
+	if f.session.conn.capabilities&smb1.CAP_LARGE_WRITEX != 0 {
+		return smb1.MaxDataSize
+	}
+	return clampToNegotiatedBuffer(smb1.MaxSmallDataSize, f.session.conn.maxBufferSize)
+}
+
+// clampToNegotiatedBuffer limits a chunk to what one negotiated message carries.
+func clampToNegotiatedBuffer(ceiling int, maxBufferSize uint32) int {
+	if maxBufferSize == 0 {
+		return ceiling
+	}
+	if fits := int(maxBufferSize) - SMBProtocolOverhead; fits > 0 && fits < ceiling {
+		return fits
+	}
+	return ceiling
+}
+
 func PipelineDepth(maxMpxCount uint16) (depth int, pipelines bool) {
 	if maxMpxCount <= 1 {
 		return 1, false
@@ -228,11 +270,7 @@ func (f *File) Read(buf []byte, ctx context.Context) (int, error) {
 	_, supportsPipelining := PipelineDepth(f.session.conn.maxMpxCount)
 
 	// Calculate maxDataPerRead for log message
-	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := smb1.MaxSmallDataSize
-	if supportsLargeReadX {
-		maxDataPerRead = smb1.MaxDataSize
-	}
+	maxDataPerRead := f.maxReadChunk()
 
 	if !supportsPipelining || len(buf) < pipelineThreshold {
 		logger.Debug("File.Read: using sequential read for %d bytes", len(buf))
@@ -253,20 +291,7 @@ func (f *File) Read(buf []byte, ctx context.Context) (int, error) {
 
 // readSequential performs a sequential read using ReadAt
 func (f *File) readSequential(buf []byte, offset int64, ctx context.Context) (int, error) {
-	// Calculate maximum read size based on negotiated buffer size and CAP_LARGE_READX
-	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := smb1.MaxSmallDataSize
-	if supportsLargeReadX {
-		maxDataPerRead = smb1.MaxDataSize
-	}
-
-	// Respect maxBufferSize if it's smaller
-	if f.session.conn.maxBufferSize > 0 {
-		calculatedMax := int(f.session.conn.maxBufferSize) - SMBProtocolOverhead
-		if calculatedMax > 0 && calculatedMax < maxDataPerRead {
-			maxDataPerRead = calculatedMax
-		}
-	}
+	maxDataPerRead := f.maxReadChunk()
 
 	totalRead := 0
 
@@ -301,12 +326,7 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 	// Ensure cancelled requests are cleaned up when function exits
 	defer f.session.conn.cleanupCancelledRequests()
 
-	// Calculate maximum read size based on CAP_LARGE_READX capability
-	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := smb1.MaxSmallDataSize
-	if supportsLargeReadX {
-		maxDataPerRead = smb1.MaxDataSize
-	}
+	maxDataPerRead := f.maxReadChunk()
 
 	// Calculate number of chunks needed
 	totalSize := len(buf)
@@ -577,10 +597,7 @@ func (f *File) readAtChunk(buf []byte, offset int64, ctx context.Context) (int, 
 	// Without CAP_LARGE_READX: MaxCountOfBytesToReturn is a bare uint16 (see smb1.MaxSmallDataSize)
 	// With CAP_LARGE_READX: MaxCountHigh + MaxCountOfBytesToReturn allows up to 127KB (NetBIOS limit)
 	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := smb1.MaxSmallDataSize
-	if supportsLargeReadX {
-		maxDataPerRead = smb1.MaxDataSize
-	}
+	maxDataPerRead := f.maxReadChunk()
 
 	readSize := len(buf)
 	if readSize > maxDataPerRead {
@@ -683,15 +700,7 @@ func (f *File) Write(data []byte, ctx context.Context) (int, error) {
 
 // writeSequential performs a sequential write using WriteAt
 func (f *File) writeSequential(data []byte, offset int64, ctx context.Context) (int, error) {
-	// Calculate maximum write size based on negotiated buffer size
-	// Fall back to the protocol ceiling if maxBufferSize is not set
-	maxDataPerWrite := smb1.MaxDataSize
-	if f.session.conn.maxBufferSize > 0 {
-		calculatedMax := int(f.session.conn.maxBufferSize) - SMBProtocolOverhead
-		if calculatedMax > 0 && calculatedMax < maxDataPerWrite {
-			maxDataPerWrite = calculatedMax
-		}
-	}
+	maxDataPerWrite := f.maxWriteChunk()
 
 	// Cancellation is honoured between chunks rather than inside one. A chunk
 	// already dispatched is waited out under a bounded deadline so its bytes
@@ -738,7 +747,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 	// Ensure cancelled requests are cleaned up when function exits
 	defer f.session.conn.cleanupCancelledRequests()
 
-	const maxDataPerWrite = smb1.MaxDataSize
+	maxDataPerWrite := f.maxWriteChunk()
 
 	// Calculate number of chunks needed
 	totalSize := len(data)
@@ -1022,7 +1031,7 @@ func (f *File) WriteAt(data []byte, offset int64, ctx context.Context) (int, err
 		return 0, nil
 	}
 
-	const maxDataPerWrite = smb1.MaxDataSize
+	maxDataPerWrite := f.maxWriteChunk()
 	writeSize := len(data)
 	if writeSize > maxDataPerWrite {
 		writeSize = maxDataPerWrite
