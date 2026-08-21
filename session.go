@@ -888,6 +888,13 @@ func (fs *Share) Lstat(name string) (os.FileInfo, error) {
 func (fs *Share) ReadDir(dirname string) ([]os.FileInfo, error) {
 	dirname = normalizePath(dirname)
 
+	// "." denotes the share root, the same as "". SMB cannot query "." itself,
+	// so it is converted here as it is in Walk; io/fs spells the root that way
+	// and the fs.FS adapter in dirfs.go accepts it.
+	if dirname == "." {
+		dirname = ""
+	}
+
 	// Empty path means root directory - don't validate
 	if dirname != "" {
 		if err := validateFilePath(dirname); err != nil {

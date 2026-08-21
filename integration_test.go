@@ -1255,3 +1255,30 @@ func TestFile_WriteReportsAccurateCountWhenCancelled(t *testing.T) {
 		})
 	}
 }
+
+// TestDir_ReadDirAcceptsDotAsShareRoot covers the two spellings of the share
+// root. "." denotes it throughout this package — Walk converts it, Glob splits
+// patterns into it, and the fs.FS adapter accepts it — but ReadDir passed it
+// through to the server, which rejected the search pattern ".\*".
+func TestDir_ReadDirAcceptsDotAsShareRoot(t *testing.T) {
+	session, cleanupSession := createTestSession(t)
+	defer cleanupSession()
+
+	share, cleanupShare := mountTestShare(t, session)
+	defer cleanupShare()
+
+	fromEmpty, err := share.ReadDir("")
+	if err != nil {
+		t.Fatalf(`ReadDir("") failed: %v`, err)
+	}
+
+	fromDot, err := share.ReadDir(".")
+	if err != nil {
+		t.Fatalf(`ReadDir(".") failed: %v`, err)
+	}
+
+	if len(fromDot) != len(fromEmpty) {
+		t.Errorf(`ReadDir(".") returned %d entries, ReadDir("") returned %d; both name the share root`,
+			len(fromDot), len(fromEmpty))
+	}
+}
