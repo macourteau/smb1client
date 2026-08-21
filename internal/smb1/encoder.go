@@ -33,6 +33,12 @@ const MaxParametersSize = 255 * 2
 // we allow up to the NetBIOS limit minus overhead for headers (~1KB).
 const MaxDataSize = 130048 // ~127KB, same as smbclient uses
 
+// MaxSmallDataSize is the data limit for a command whose length field is a bare
+// uint16, so no capability extends it: READ_ANDX without CAP_LARGE_READX and
+// WRITE_ANDX without CAP_LARGE_WRITEX. It is 65535 rounded down to a 16-byte
+// boundary, which servers of this vintage expect.
+const MaxSmallDataSize = 65520
+
 // Packet represents a complete SMB1 protocol packet.
 // A packet consists of:
 //   - Header (32 bytes)
