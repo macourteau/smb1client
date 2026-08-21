@@ -1,6 +1,7 @@
 package smb1
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 )
@@ -505,5 +506,43 @@ func TestNegotiateRoundTrip(t *testing.T) {
 
 	if !resp.RequiresEncryption() {
 		t.Error("expected server to require encryption")
+	}
+}
+
+// TestDecodeNegotiateResponseExtendedSecurity covers the data section of a
+// negotiate response from a server advertising CAP_EXTENDED_SECURITY. It
+// carries a 16-byte ServerGUID and a GSS token, with no challenge and no names
+// at all. Reading names out of it returns whatever those bytes decode to: a
+// Windows server appeared to report its domain as a fragment of its own
+// SPNEGO blob.
+func TestDecodeNegotiateResponseExtendedSecurity(t *testing.T) {
+	guid := []byte{0x11, 0x3F, 0x96, 0xC3, 0xE2, 0xCE, 0x49, 0x4E, 0x8A, 0x00, 0xB7, 0x4A, 0xA6, 0xBC, 0xFB, 0x99}
+	// The start of a real SPNEGO NegTokenInit2: GSS framing plus the SPNEGO OID.
+	blob := []byte{0x60, 0x28, 0x06, 0x06, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x02}
+
+	params := make([]byte, 34)
+	caps := CAP_NT_SMBS | CAP_UNICODE | CAP_LARGE_FILES | CAP_STATUS32 | CAP_EXTENDED_SECURITY
+	binary.LittleEndian.PutUint32(params[19:23], caps)
+	params[33] = 0 // ChallengeLength is zero under extended security
+
+	resp, err := DecodeNegotiateResponse(params, append(append([]byte{}, guid...), blob...))
+	if err != nil {
+		t.Fatalf("DecodeNegotiateResponse() error = %v", err)
+	}
+
+	if resp.ServerName != "" {
+		t.Errorf("ServerName = %q, want empty: the response carries no name", resp.ServerName)
+	}
+	if resp.DomainName != "" {
+		t.Errorf("DomainName = %q, want empty: the response carries no name", resp.DomainName)
+	}
+	if !bytes.Equal(resp.ServerGUID, guid) {
+		t.Errorf("ServerGUID = %x, want %x", resp.ServerGUID, guid)
+	}
+	if !bytes.Equal(resp.SecurityBlob, blob) {
+		t.Errorf("SecurityBlob = %x, want %x", resp.SecurityBlob, blob)
+	}
+	if len(resp.Challenge) != 0 {
+		t.Errorf("Challenge = %x, want empty", resp.Challenge)
 	}
 }

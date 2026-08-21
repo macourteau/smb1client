@@ -56,9 +56,18 @@ type NegotiateResponse struct {
 	ServerTimeZone  int16  // Minutes from UTC
 	ChallengeLength uint8  // Length of challenge
 	Challenge       []byte // NTLM challenge (usually 8 bytes)
-	DomainName      string // Server domain name
-	ServerName      string // Server name
+	DomainName      string // Server domain name (absent under extended security)
+	ServerName      string // Server name (absent under extended security)
+
+	// ServerGUID and SecurityBlob replace the challenge and the names when the
+	// server advertises CAP_EXTENDED_SECURITY. Both are empty otherwise.
+	ServerGUID   []byte
+	SecurityBlob []byte
 }
+
+// serverGUIDLength is the size of the ServerGUID an extended-security negotiate
+// response carries ahead of its security blob.
+const serverGUIDLength = 16
 
 // Security mode flags for NegotiateResponse.SecurityMode
 const (
@@ -157,6 +166,20 @@ func DecodeNegotiateResponse(params, data []byte) (*NegotiateResponse, error) {
 	// Extract challenge
 	resp.Challenge = make([]byte, resp.ChallengeLength)
 	copy(resp.Challenge, data[0:resp.ChallengeLength])
+
+	// A server advertising extended security sends something else entirely in
+	// the data section: a 16-byte ServerGUID followed by a GSS token, with no
+	// challenge and no names at all ([MS-CIFS] 2.2.4.52.2). Reading names out of
+	// it yields whatever the GUID and token bytes happen to decode to — a
+	// Windows server reported its domain as a fragment of its own SPNEGO blob.
+	if (resp.Capabilities & CAP_EXTENDED_SECURITY) != 0 {
+		if len(data) >= serverGUIDLength {
+			resp.ServerGUID = make([]byte, serverGUIDLength)
+			copy(resp.ServerGUID, data[:serverGUIDLength])
+			resp.SecurityBlob = append([]byte(nil), data[serverGUIDLength:]...)
+		}
+		return resp, nil
+	}
 
 	// Parse domain and server names
 	offset := int(resp.ChallengeLength)
