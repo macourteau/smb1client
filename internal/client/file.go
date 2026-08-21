@@ -387,7 +387,7 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		case <-f.session.conn.done:
 			// Connection closed - setError() or Close() will clean up all pending MIDs
 			// including the current chunk, so no explicit cleanup needed here
-			return totalRead, f.session.conn.err
+			return totalRead, f.session.conn.connError()
 		}
 
 		// Handle response error
@@ -477,8 +477,9 @@ func (f *File) sendReadRequest(chunk *readChunk, ctx context.Context) error {
 	// Check if connection is closed
 	select {
 	case <-f.session.conn.done:
+		err := f.session.conn.err
 		f.session.conn.mu.Unlock()
-		return f.session.conn.err
+		return err
 	default:
 	}
 
@@ -813,7 +814,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		case <-f.session.conn.done:
 			// Connection closed - setError() or Close() will clean up all pending MIDs
 			// including the current chunk, so no explicit cleanup needed here
-			return totalWritten, f.session.conn.err
+			return totalWritten, f.session.conn.connError()
 		}
 
 		// Handle response error
@@ -893,8 +894,9 @@ func (f *File) sendWriteRequest(chunk *writeChunk, ctx context.Context) error {
 	// Check if connection is closed
 	select {
 	case <-f.session.conn.done:
+		err := f.session.conn.err
 		f.session.conn.mu.Unlock()
-		return f.session.conn.err
+		return err
 	default:
 	}
 

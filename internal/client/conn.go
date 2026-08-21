@@ -118,6 +118,7 @@ func (c *Conn) Close() error {
 
 	close(c.done)
 	c.err = ErrConnectionClosed
+	closeErr := c.err
 
 	// Swap out pending map to prevent Receive() from accessing it
 	pending := c.pending
@@ -127,7 +128,7 @@ func (c *Conn) Close() error {
 	// Cleanup outside lock to avoid blocking Receive()
 	for _, req := range pending {
 		select {
-		case req.respCh <- &response{err: c.err}:
+		case req.respCh <- &response{err: closeErr}:
 		default:
 		}
 		close(req.respCh)
@@ -169,8 +170,9 @@ func (c *Conn) send(header *smb1.Header, params, data []byte) error {
 	// Check if connection is closed
 	select {
 	case <-c.done:
+		err := c.err
 		c.mu.Unlock()
-		return c.err
+		return err
 	default:
 	}
 
@@ -233,7 +235,7 @@ func (c *Conn) awaitResponse(respCh <-chan *response, mid uint16, ctx context.Co
 		return nil, ctx.Err()
 	case <-c.done:
 		logger.Debug("sendRecv: connection closed for MID %d", mid)
-		return nil, c.err
+		return nil, c.connError()
 	}
 }
 
@@ -363,8 +365,9 @@ func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx contex
 
 	select {
 	case <-c.done:
+		err := c.err
 		c.mu.Unlock()
-		return nil, 0, nil, c.err
+		return nil, 0, nil, err
 	default:
 	}
 
@@ -482,6 +485,20 @@ func (c *Conn) Receive() {
 			// Channel full or closed - waiter gave up
 		}
 	}
+}
+
+// connError returns the error that closed the connection, or nil if it is
+// still open.
+//
+// c.err is written under c.mu by Close and setError, so every read from
+// outside that lock has to go through here. Reading the field directly is a
+// data race even when the done channel has already been observed as closed:
+// observing a closed channel does not synchronise with the write that
+// preceded it under a different lock.
+func (c *Conn) connError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
 }
 
 // setError sets the connection error and wakes all waiters.
