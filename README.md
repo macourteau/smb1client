@@ -545,10 +545,17 @@ signatures (`compat_gosmb2_test.go` guards part of this).
 
 MIT License — see [LICENSE](LICENSE) for details.
 
+`internal/ntlm` and `internal/spnego` are derived from
+[go-smb2](https://github.com/hirochachacha/go-smb2), which is BSD-2-Clause.
+That license requires its notice to be retained in redistributed source, so it
+is reproduced in [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY) and named in the
+headers of the derived files.
+
 ## Acknowledgments
 
 - API design based on the excellent [go-smb2](https://github.com/hirochachacha/go-smb2) library by hirochachacha
-- NTLM implementation adapted from go-smb2 (BSD-2-Clause License)
+- NTLM and SPNEGO implementations adapted from go-smb2 (BSD-2-Clause; see
+  [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY))
 - Protocol specifications from Microsoft [MS-CIFS] and [MS-SMB]
 - Tested against Samba and Windows implementations
 

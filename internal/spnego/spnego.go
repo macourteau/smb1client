@@ -1,3 +1,6 @@
+// Derived from go-smb2 (https://github.com/hirochachacha/go-smb2),
+// Copyright (c) 2016 Hiroshi Ioka, BSD-2-Clause. See LICENSE-THIRD-PARTY.
+
 package spnego
 
 import (
