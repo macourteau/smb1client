@@ -229,9 +229,9 @@ func (f *File) Read(buf []byte, ctx context.Context) (int, error) {
 
 	// Calculate maxDataPerRead for log message
 	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := 65520
+	maxDataPerRead := smb1.MaxSmallDataSize
 	if supportsLargeReadX {
-		maxDataPerRead = 130048
+		maxDataPerRead = smb1.MaxDataSize
 	}
 
 	if !supportsPipelining || len(buf) < pipelineThreshold {
@@ -255,9 +255,9 @@ func (f *File) Read(buf []byte, ctx context.Context) (int, error) {
 func (f *File) readSequential(buf []byte, offset int64, ctx context.Context) (int, error) {
 	// Calculate maximum read size based on negotiated buffer size and CAP_LARGE_READX
 	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := 65520 // Default: 64KB
+	maxDataPerRead := smb1.MaxSmallDataSize
 	if supportsLargeReadX {
-		maxDataPerRead = 130048 // 127KB when CAP_LARGE_READX available
+		maxDataPerRead = smb1.MaxDataSize
 	}
 
 	// Respect maxBufferSize if it's smaller
@@ -303,9 +303,9 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 
 	// Calculate maximum read size based on CAP_LARGE_READX capability
 	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := 65520 // Default: 64KB
+	maxDataPerRead := smb1.MaxSmallDataSize
 	if supportsLargeReadX {
-		maxDataPerRead = 130048 // 127KB when CAP_LARGE_READX available
+		maxDataPerRead = smb1.MaxDataSize
 	}
 
 	// Calculate number of chunks needed
@@ -574,12 +574,12 @@ func (f *File) readAtChunk(buf []byte, offset int64, ctx context.Context) (int, 
 
 	// Calculate maximum read size per operation
 	// SMB1 READ_ANDX supports large reads via CAP_LARGE_READX capability extension.
-	// Without CAP_LARGE_READX: MaxCountOfBytesToReturn uint16 limits to 65535 bytes (use 65520 for alignment)
+	// Without CAP_LARGE_READX: MaxCountOfBytesToReturn is a bare uint16 (see smb1.MaxSmallDataSize)
 	// With CAP_LARGE_READX: MaxCountHigh + MaxCountOfBytesToReturn allows up to 127KB (NetBIOS limit)
 	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
-	maxDataPerRead := 65520 // Default: 64KB
+	maxDataPerRead := smb1.MaxSmallDataSize
 	if supportsLargeReadX {
-		maxDataPerRead = 130048 // 127KB when CAP_LARGE_READX available (same as writes)
+		maxDataPerRead = smb1.MaxDataSize
 	}
 
 	readSize := len(buf)
@@ -668,7 +668,8 @@ func (f *File) Write(data []byte, ctx context.Context) (int, error) {
 		logger.Debug("File.Write: using sequential write for %d bytes", len(data))
 		totalWritten, err = f.writeSequential(data, offset, ctx)
 	} else {
-		logger.Debug("File.Write: using PIPELINED write for %d bytes (%d chunks)", len(data), (len(data)+65519)/65520)
+		logger.Debug("File.Write: using PIPELINED write for %d bytes (%d chunks)", len(data),
+			(len(data)+smb1.MaxSmallDataSize-1)/smb1.MaxSmallDataSize)
 		totalWritten, err = f.writePipelined(data, offset, ctx)
 	}
 
@@ -683,8 +684,8 @@ func (f *File) Write(data []byte, ctx context.Context) (int, error) {
 // writeSequential performs a sequential write using WriteAt
 func (f *File) writeSequential(data []byte, offset int64, ctx context.Context) (int, error) {
 	// Calculate maximum write size based on negotiated buffer size
-	// Fall back to 130048 (127KB) if maxBufferSize is not set
-	maxDataPerWrite := 130048
+	// Fall back to the protocol ceiling if maxBufferSize is not set
+	maxDataPerWrite := smb1.MaxDataSize
 	if f.session.conn.maxBufferSize > 0 {
 		calculatedMax := int(f.session.conn.maxBufferSize) - SMBProtocolOverhead
 		if calculatedMax > 0 && calculatedMax < maxDataPerWrite {
@@ -737,7 +738,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 	// Ensure cancelled requests are cleaned up when function exits
 	defer f.session.conn.cleanupCancelledRequests()
 
-	const maxDataPerWrite = 130048 // 127KB
+	const maxDataPerWrite = smb1.MaxDataSize
 
 	// Calculate number of chunks needed
 	totalSize := len(data)
@@ -1021,10 +1022,7 @@ func (f *File) WriteAt(data []byte, offset int64, ctx context.Context) (int, err
 		return 0, nil
 	}
 
-	// Calculate maximum write size per operation
-	// NetBIOS session layer limits messages to 131072 bytes (128KB)
-	// We need overhead for SMB headers (~1KB), so aim for ~127KB max data
-	const maxDataPerWrite = 130048 // Same as smbclient uses (127KB)
+	const maxDataPerWrite = smb1.MaxDataSize
 	writeSize := len(data)
 	if writeSize > maxDataPerWrite {
 		writeSize = maxDataPerWrite
