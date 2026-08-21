@@ -111,7 +111,7 @@ func (d *Dialer) DialContext(ctx context.Context, tcpConn net.Conn) (*Session, e
 	logger.Debug("Starting SMB1 dial to %s", tcpConn.RemoteAddr())
 
 	// Create connection (wraps TCP conn with NetBIOS framing)
-	conn := client.NewConn(tcpConn)
+	conn := client.NewConn(tcpConn, client.WithConnLogger(logger))
 
 	// Start background receive loop.
 	//

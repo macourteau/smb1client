@@ -66,6 +66,10 @@ type pendingRequest struct {
 type Conn struct {
 	netbiosConn *netbios.Session // NetBIOS-wrapped TCP connection
 
+	// logger is written once at construction and read by the receive loop,
+	// which is started afterwards, so it needs no lock.
+	logger logging.Logger
+
 	mu            sync.Mutex                 // protects shared state below
 	nextMID       uint16                     // next message ID to allocate
 	pending       map[uint16]*pendingRequest // pending requests waiting for responses
@@ -86,12 +90,28 @@ type Conn struct {
 
 // NewConn creates a new SMB1 connection wrapping the provided TCP connection.
 // The TCP connection should already be established to the SMB server (typically port 445).
-func NewConn(tcpConn net.Conn) *Conn {
-	return &Conn{
+func NewConn(tcpConn net.Conn, opts ...ConnOption) *Conn {
+	c := &Conn{
 		netbiosConn: netbios.NewSession(tcpConn),
 		pending:     make(map[uint16]*pendingRequest),
 		done:        make(chan struct{}),
+		logger:      logging.FromContext(context.Background()),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// ConnOption configures a Conn at construction.
+type ConnOption func(*Conn)
+
+// WithConnLogger sets the logger the receive loop writes to. That loop outlives
+// any single request, so unlike every other path in this package it has no
+// request context to take a logger from. Apply it at construction: the loop
+// reads the field without synchronisation, having been started afterwards.
+func WithConnLogger(l logging.Logger) ConnOption {
+	return func(c *Conn) { c.logger = l }
 }
 
 // GetCapabilities returns the negotiated server capabilities.
@@ -432,6 +452,8 @@ func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx contex
 //   - The deferred Close() call ensures cleanup even if the goroutine panics
 //   - This guarantees the goroutine always exits when the connection is closed
 func (c *Conn) Receive() {
+	logger := c.logger
+
 	defer func() {
 		// Connection closed, wake all pending requests
 		c.Close()
@@ -456,7 +478,7 @@ func (c *Conn) Receive() {
 		// Decode packet
 		header, params, data, err := smb1.DecodePacket(packet)
 		if err != nil {
-			// Malformed packet - log and continue
+			logger.Warn("Discarding malformed packet of %d bytes: %v", len(packet), err)
 			continue
 		}
 
@@ -464,8 +486,14 @@ func (c *Conn) Receive() {
 		c.mu.Lock()
 		req, ok := c.pending[header.MID]
 		if !ok {
-			// No one waiting for this MID
 			c.mu.Unlock()
+			// Usually a late reply to a request that was already abandoned,
+			// which is worth no more than a debug line. It is also the only
+			// place a genuinely unexpected frame — a duplicate reply, or an
+			// answer to an ID never issued — would otherwise vanish without a
+			// trace, so it is not discarded silently.
+			logger.Debug("Discarding response for unknown MID %d (command 0x%02X, status 0x%08X)",
+				header.MID, header.Command, header.Status)
 			continue
 		}
 		if req.cancelled {
