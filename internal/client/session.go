@@ -334,6 +334,7 @@ func (t *Tree) SendTransact2(subcommand uint16, params, data []byte, ctx context
 		params,
 		data,
 		"",
+		t.Session.conn.transactionMaxDataCount(smb1.TransactionMaxParameterCount),
 	)
 	if err != nil {
 		return nil, err
@@ -474,7 +475,8 @@ func dosAttributes(attrs uint32) uint16 {
 // The name parameter is typically a pipe name like "\\PIPE\\LANMAN".
 func (t *Tree) SendTransaction(name string, params, data []byte, ctx context.Context) (*smb1.Trans2Response, error) {
 	// Encode TRANSACTION request
-	allParams, dataBytes, err := smb1.EncodeTransactionRequest(name, params, data)
+	allParams, dataBytes, err := smb1.EncodeTransactionRequest(name, params, data,
+		t.Session.conn.transactionMaxDataCount(smb1.TransactionMaxParameterCount))
 	if err != nil {
 		return nil, err
 	}

@@ -1345,7 +1345,8 @@ func (f *File) TransactNamedPipe(data []byte, ctx context.Context) ([]byte, erro
 	logger.Debug("TransactNamedPipe: sending %d bytes to pipe FID=%d", len(data), f.fid)
 
 	// First, try the proper SMB TransactNamedPipe function (0x0026)
-	allParams, dataBytes, err := smb1.EncodeTransactNamedPipeRequest(f.fid, data)
+	allParams, dataBytes, err := smb1.EncodeTransactNamedPipeRequest(f.fid, data,
+		f.session.conn.transactionMaxDataCount(0))
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode TransactNamedPipe request: %w", err)
 	}

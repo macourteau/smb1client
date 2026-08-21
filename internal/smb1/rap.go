@@ -269,7 +269,7 @@ func parseNullTerminatedString(data []byte) (string, error) {
 //
 // The transaction request format is similar to TRANS2 but uses a different
 // command (SMB_COM_TRANSACTION) and has a Name field for the pipe name.
-func EncodeTransactionRequest(name string, params, data []byte) ([]byte, []byte, error) {
+func EncodeTransactionRequest(name string, params, data []byte, maxDataCount uint16) ([]byte, []byte, error) {
 	// Calculate sizes
 	paramCount := uint16(len(params))
 	dataCount := uint16(len(data))
@@ -299,10 +299,10 @@ func EncodeTransactionRequest(name string, params, data []byte) ([]byte, []byte,
 
 	// Encode fixed parameters (14 words = 28 bytes, plus 2 setup words)
 	fixedParams := make([]byte, 28)
-	binary.LittleEndian.PutUint16(fixedParams[0:2], paramCount)    // TotalParameterCount
-	binary.LittleEndian.PutUint16(fixedParams[2:4], dataCount)     // TotalDataCount
-	binary.LittleEndian.PutUint16(fixedParams[4:6], 1024)          // MaxParameterCount
-	binary.LittleEndian.PutUint16(fixedParams[6:8], 65535)         // MaxDataCount
+	binary.LittleEndian.PutUint16(fixedParams[0:2], paramCount) // TotalParameterCount
+	binary.LittleEndian.PutUint16(fixedParams[2:4], dataCount)  // TotalDataCount
+	binary.LittleEndian.PutUint16(fixedParams[4:6], TransactionMaxParameterCount)
+	binary.LittleEndian.PutUint16(fixedParams[6:8], maxDataCount)
 	fixedParams[8] = 0                                             // MaxSetupCount
 	fixedParams[9] = 0                                             // Reserved1
 	binary.LittleEndian.PutUint16(fixedParams[10:12], 0)           // Flags
@@ -342,7 +342,7 @@ func EncodeTransactionRequest(name string, params, data []byte) ([]byte, []byte,
 // EncodeTransactNamedPipeRequest encodes a TRANSACTION request for TransactNamedPipe (0x0026).
 // This is used for RPC operations over named pipes.
 // Unlike EncodeTransactionRequest which uses pipe names for RAP, this uses a FID.
-func EncodeTransactNamedPipeRequest(fid uint16, data []byte) ([]byte, []byte, error) {
+func EncodeTransactNamedPipeRequest(fid uint16, data []byte, maxDataCount uint16) ([]byte, []byte, error) {
 	// Calculate sizes
 	paramCount := uint16(0) // No parameters for TransactNamedPipe
 	dataCount := uint16(len(data))
@@ -359,10 +359,10 @@ func EncodeTransactNamedPipeRequest(fid uint16, data []byte) ([]byte, []byte, er
 
 	// Encode fixed parameters (14 words = 28 bytes, plus 2 setup words)
 	fixedParams := make([]byte, 28)
-	binary.LittleEndian.PutUint16(fixedParams[0:2], paramCount)    // TotalParameterCount
-	binary.LittleEndian.PutUint16(fixedParams[2:4], dataCount)     // TotalDataCount
-	binary.LittleEndian.PutUint16(fixedParams[4:6], 0)             // MaxParameterCount
-	binary.LittleEndian.PutUint16(fixedParams[6:8], 65535)         // MaxDataCount
+	binary.LittleEndian.PutUint16(fixedParams[0:2], paramCount) // TotalParameterCount
+	binary.LittleEndian.PutUint16(fixedParams[2:4], dataCount)  // TotalDataCount
+	binary.LittleEndian.PutUint16(fixedParams[4:6], 0)          // MaxParameterCount
+	binary.LittleEndian.PutUint16(fixedParams[6:8], maxDataCount)
 	fixedParams[8] = 0                                             // MaxSetupCount
 	fixedParams[9] = 0                                             // Reserved1
 	binary.LittleEndian.PutUint16(fixedParams[10:12], 0)           // Flags

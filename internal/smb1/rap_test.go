@@ -395,7 +395,7 @@ func TestEncodeTransactionRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allParams, dataSection, err := EncodeTransactionRequest(tt.pipeName, tt.params, tt.data)
+			allParams, dataSection, err := EncodeTransactionRequest(tt.pipeName, tt.params, tt.data, 4096)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("EncodeTransactionRequest() error = %v, wantErr %v", err, tt.wantErr)
 				return

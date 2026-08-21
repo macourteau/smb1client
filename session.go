@@ -23,10 +23,12 @@ const (
 	// Retries use exponential backoff with a cap of 1 second between attempts.
 	maxRemoveRetries = 10
 
-	// rapReceiveBufferSize is the maximum buffer size for RAP (Remote Administration
-	// Protocol) responses. RAP is used for operations like NetShareEnum to list
-	// available shares. This size matches the maximum SMB1 buffer size of 64KB - 1.
-	rapReceiveBufferSize = 65535
+	// rapReceiveBufferSizeCap is the largest buffer a RAP (Remote Administration
+	// Protocol) response may be asked for. RAP is used for operations like
+	// NetShareEnum to list available shares. The value actually sent is this
+	// capped to what the negotiated SMB buffer can carry, because a server given
+	// a hint larger than one message holds may refuse the transaction outright.
+	rapReceiveBufferSizeCap = 65535
 
 	// findRequestBatchSize is the number of directory entries to request in each
 	// FIND_FIRST2/FIND_NEXT2 transaction for optimal performance. Smaller batch
@@ -296,9 +298,13 @@ func (c *Session) listSharenamesRAP() ([]string, error) {
 	}()
 
 	// Create NetShareEnum RAP request (info level 1)
+	receiveBuf := smb1.MaxTransactionDataCount(c.Capabilities().MaxBufferSize, smb1.TransactionMaxParameterCount)
+	if receiveBuf > rapReceiveBufferSizeCap {
+		receiveBuf = rapReceiveBufferSizeCap
+	}
 	req := &smb1.NetShareEnumRequest{
-		InfoLevel:  1,                    // Level 1 provides name, type, and comment
-		ReceiveBuf: rapReceiveBufferSize, // Maximum receive buffer
+		InfoLevel:  1, // Level 1 provides name, type, and comment
+		ReceiveBuf: receiveBuf,
 	}
 
 	// Encode RAP request

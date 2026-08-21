@@ -76,7 +76,7 @@ func TestEncodeTrans2Request(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			params, data, err := EncodeTrans2Request(tt.setup, tt.params, tt.data, tt.reqName)
+			params, data, err := EncodeTrans2Request(tt.setup, tt.params, tt.data, tt.reqName, 4096)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("EncodeTrans2Request() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -1176,5 +1176,72 @@ func TestEmptyDirectory(t *testing.T) {
 	}
 	if len(result.Files) != 0 {
 		t.Errorf("got %d files from truncated data, want 0", len(result.Files))
+	}
+}
+
+func TestMaxTransactionDataCount(t *testing.T) {
+	tests := []struct {
+		name              string
+		maxBufferSize     uint32
+		maxParameterCount uint16
+		want              uint16
+	}{
+		{
+			name:              "Windows negotiates the SMB1 minimum",
+			maxBufferSize:     4356,
+			maxParameterCount: TransactionMaxParameterCount,
+			want:              4356 - 64 - 1024,
+		},
+		{
+			name:              "Samba buffer",
+			maxBufferSize:     16644,
+			maxParameterCount: TransactionMaxParameterCount,
+			want:              16644 - 64 - 1024,
+		},
+		{
+			name:              "no response parameters leaves more room for data",
+			maxBufferSize:     4356,
+			maxParameterCount: 0,
+			want:              4356 - 64,
+		},
+		{
+			name:              "an oversized buffer saturates the uint16 field",
+			maxBufferSize:     1 << 20,
+			maxParameterCount: TransactionMaxParameterCount,
+			want:              65535,
+		},
+		{
+			name:              "a pathological buffer still yields a usable floor",
+			maxBufferSize:     512,
+			maxParameterCount: TransactionMaxParameterCount,
+			want:              minTransactionDataCount,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := MaxTransactionDataCount(tt.maxBufferSize, tt.maxParameterCount); got != tt.want {
+				t.Errorf("MaxTransactionDataCount(%d, %d) = %d, want %d",
+					tt.maxBufferSize, tt.maxParameterCount, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEncodeTrans2RequestAdvertisesCallerBudget guards the field that made
+// directory listings fail against servers negotiating a small buffer: the
+// encoder must send the budget it is given, not a fixed 64 KiB.
+func TestEncodeTrans2RequestAdvertisesCallerBudget(t *testing.T) {
+	const want = 3268
+
+	fixedParams, _, err := EncodeTrans2Request([]uint16{TRANS2_FIND_FIRST2}, []byte{1, 2}, nil, "", want)
+	if err != nil {
+		t.Fatalf("EncodeTrans2Request() error = %v", err)
+	}
+	if got := binary.LittleEndian.Uint16(fixedParams[6:8]); got != want {
+		t.Errorf("MaxDataCount = %d, want %d", got, want)
+	}
+	if got := binary.LittleEndian.Uint16(fixedParams[4:6]); got != TransactionMaxParameterCount {
+		t.Errorf("MaxParameterCount = %d, want %d", got, TransactionMaxParameterCount)
 	}
 }

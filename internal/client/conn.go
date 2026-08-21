@@ -97,6 +97,12 @@ func (c *Conn) GetCapabilities() (maxMpx uint16, maxBuf uint32, serverName, doma
 	return c.maxMpxCount, c.maxBufferSize, c.serverName, c.domainName
 }
 
+// transactionMaxDataCount returns the reply budget to advertise on TRANS2 and
+// TRANSACTION requests for this connection's negotiated buffer size.
+func (c *Conn) transactionMaxDataCount(maxParameterCount uint16) uint16 {
+	return smb1.MaxTransactionDataCount(c.maxBufferSize, maxParameterCount)
+}
+
 // Close closes the connection and cleans up all resources.
 // It wakes all pending requests with an error and closes the underlying connection.
 func (c *Conn) Close() error {
