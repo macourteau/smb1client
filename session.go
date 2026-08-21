@@ -224,16 +224,6 @@ func (c *Session) Mount(sharename string) (*Share, error) {
 	}, nil
 }
 
-// isNotSupportedError checks if an error is STATUS_NOT_SUPPORTED.
-func isNotSupportedError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Check if error message contains "not supported" status code
-	errStr := err.Error()
-	return strings.Contains(errStr, "0xC00000BB") || strings.Contains(strings.ToLower(errStr), "not supported")
-}
-
 // ListSharenames enumerates available shares on the server.
 //
 // This method first attempts to use the RAP (Remote Administration Protocol)
@@ -261,27 +251,23 @@ func isNotSupportedError(err error) bool {
 func (c *Session) ListSharenames() ([]string, error) {
 	logger := LoggerFromContext(c.ctx)
 
-	// Try RAP first (faster, legacy compatible)
+	// RAP is tried first: one round trip, and it is all the oldest servers
+	// speak. Any RAP failure falls through to RPC, not just an explicit
+	// STATUS_NOT_SUPPORTED — a server with the LANMAN pipe disabled may
+	// instead answer with an empty transaction, which only fails when the
+	// reply is decoded and so never looked like "not supported".
 	logger.Debug("Attempting share enumeration via RAP (\\PIPE\\LANMAN)")
-	shares, err := c.listSharenamesRAP()
-	if err == nil {
+	shares, rapErr := c.listSharenamesRAP()
+	if rapErr == nil {
 		logger.Debug("RAP share enumeration succeeded, found %d shares", len(shares))
 		return shares, nil
 	}
+	logger.Debug("RAP share enumeration failed, falling back to RPC/SRVSVC: %v", rapErr)
 
-	// Check if error is STATUS_NOT_SUPPORTED
-	if !isNotSupportedError(err) {
-		// RAP failed for reason other than not supported
-		logger.Debug("RAP share enumeration failed: %v", err)
-		return nil, err
-	}
-
-	// RAP not supported, try RPC/SRVSVC
-	logger.Debug("RAP not supported, falling back to RPC/SRVSVC")
-	shares, err = c.listSharenamesRPC()
-	if err != nil {
-		logger.Debug("RPC share enumeration failed: %v", err)
-		return nil, fmt.Errorf("share enumeration failed (RAP not supported, RPC failed): %w", err)
+	shares, rpcErr := c.listSharenamesRPC()
+	if rpcErr != nil {
+		logger.Debug("RPC share enumeration failed: %v", rpcErr)
+		return nil, fmt.Errorf("share enumeration failed: RAP: %w; RPC: %w", rapErr, rpcErr)
 	}
 
 	logger.Debug("RPC share enumeration succeeded, found %d shares", len(shares))
