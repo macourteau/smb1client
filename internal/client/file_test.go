@@ -1204,8 +1204,22 @@ func TestFileWritePipelinedMIDCleanupOnCancel(t *testing.T) {
 		// Cancel the context
 		cancel()
 
-		// Give time for cleanup to complete
+		// A cancelled write does not drop what it already put on the wire: it
+		// waits for those chunks so the byte count it returns matches what the
+		// file actually holds. Their MIDs therefore stay registered until the
+		// responses arrive. This mock never answers, so the wait runs all the
+		// way to the drain deadline — and nothing may leak once it does.
 		time.Sleep(100 * time.Millisecond)
+
+		tree.Session.conn.mu.Lock()
+		duringDrain := len(tree.Session.conn.pending)
+		tree.Session.conn.mu.Unlock()
+		if duringDrain != midsAllocated {
+			t.Errorf("MIDs registered while draining = %d, want the %d still awaiting responses",
+				duringDrain, midsAllocated)
+		}
+
+		time.Sleep(writeDrainTimeout + time.Second)
 
 		// Verify all MIDs were cleaned up
 		tree.Session.conn.mu.Lock()
@@ -1217,7 +1231,7 @@ func TestFileWritePipelinedMIDCleanupOnCancel(t *testing.T) {
 		t.Logf("MIDs remaining after cancellation: %d (MIDs: %v)", remaining, remainingMIDs)
 		tree.Session.conn.mu.Unlock()
 
-		// The critical assertion: no MID leaks
+		// The critical assertion: no MID leaks once the drain has finished
 		if remaining != 0 {
 			t.Errorf("MID leak detected: %d MIDs still pending after context cancellation (expected 0, got MIDs: %v)", remaining, remainingMIDs)
 		}
