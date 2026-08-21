@@ -1262,7 +1262,7 @@ func TestFileReadPipelinedWithEnhancedMock(t *testing.T) {
 		defer conn.Close()
 		conn.maxBufferSize = 65535
 		conn.maxMpxCount = 3 // Enable pipelining with 3 concurrent requests
-		conn.capabilities = smb1.CAP_LARGE_FILES
+		conn.capabilities = smb1.CAP_LARGE_FILES | smb1.CAP_LARGE_READX
 
 		session := &Session{
 			conn:      conn,
@@ -1429,7 +1429,7 @@ func TestFileWritePipelinedWithEnhancedMock(t *testing.T) {
 		defer conn.Close()
 		conn.maxBufferSize = 200000 // Large buffer to avoid limiting chunk size
 		conn.maxMpxCount = 3        // Enable pipelining with 3 concurrent requests
-		conn.capabilities = smb1.CAP_LARGE_FILES
+		conn.capabilities = smb1.CAP_LARGE_FILES | smb1.CAP_LARGE_WRITEX
 
 		session := &Session{
 			conn:      conn,
@@ -1593,7 +1593,7 @@ func TestPipelinedReadOutOfOrderResponses(t *testing.T) {
 		defer conn.Close()
 		conn.maxBufferSize = 65535
 		conn.maxMpxCount = 4 // Enable pipelining with 4 concurrent requests
-		conn.capabilities = smb1.CAP_LARGE_FILES
+		conn.capabilities = smb1.CAP_LARGE_FILES | smb1.CAP_LARGE_READX
 
 		session := &Session{
 			conn:      conn,
@@ -1727,7 +1727,7 @@ func TestPipelinedReadWithErrors(t *testing.T) {
 		defer conn.Close()
 		conn.maxBufferSize = 65535
 		conn.maxMpxCount = 3 // Enable pipelining with 3 concurrent requests
-		conn.capabilities = smb1.CAP_LARGE_FILES
+		conn.capabilities = smb1.CAP_LARGE_FILES | smb1.CAP_LARGE_READX
 
 		session := &Session{
 			conn:      conn,
@@ -1972,4 +1972,83 @@ func TestFileTransactNamedPipeBasic(t *testing.T) {
 
 		t.Logf("TransactNamedPipe result: %d bytes, err=%v", len(result), err)
 	})
+}
+
+// TestChunkSizeCeilings pins how a transfer chunk is sized. The read and write
+// paths, sequential and pipelined, all go through these two functions, so a
+// transfer's chunk size no longer depends on which side of the pipelining
+// threshold it landed on.
+func TestChunkSizeCeilings(t *testing.T) {
+	const smb1MinimumBuffer = 4356
+
+	tests := []struct {
+		name          string
+		capabilities  uint32
+		maxBufferSize uint32
+		wantRead      int
+		wantWrite     int
+	}{
+		{
+			name:          "large transfers advertised, minimum buffer negotiated",
+			capabilities:  smb1.CAP_LARGE_READX | smb1.CAP_LARGE_WRITEX,
+			maxBufferSize: smb1MinimumBuffer,
+			// The capabilities are what lift the bound, so a small buffer does
+			// not drag the chunk down with it.
+			wantRead:  smb1.MaxSmallDataSize,
+			wantWrite: smb1.MaxDataSize,
+		},
+		{
+			name:          "large transfers advertised, roomy buffer",
+			capabilities:  smb1.CAP_LARGE_READX | smb1.CAP_LARGE_WRITEX,
+			maxBufferSize: 65535,
+			wantRead:      smb1.MaxSmallDataSize,
+			wantWrite:     smb1.MaxDataSize,
+		},
+		{
+			name:          "no large transfers, small buffer bounds both",
+			capabilities:  0,
+			maxBufferSize: smb1MinimumBuffer,
+			wantRead:      smb1MinimumBuffer - SMBProtocolOverhead,
+			wantWrite:     smb1MinimumBuffer - SMBProtocolOverhead,
+		},
+		{
+			name:          "no large transfers, buffer larger than the 16-bit limit",
+			capabilities:  0,
+			maxBufferSize: 1 << 20,
+			wantRead:      smb1.MaxSmallDataSize,
+			wantWrite:     smb1.MaxSmallDataSize,
+		},
+		{
+			name:          "buffer not negotiated",
+			capabilities:  0,
+			maxBufferSize: 0,
+			wantRead:      smb1.MaxSmallDataSize,
+			wantWrite:     smb1.MaxSmallDataSize,
+		},
+		{
+			name:          "only reads are large",
+			capabilities:  smb1.CAP_LARGE_READX,
+			maxBufferSize: smb1MinimumBuffer,
+			wantRead:      smb1.MaxSmallDataSize,
+			wantWrite:     smb1MinimumBuffer - SMBProtocolOverhead,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := NewConn(newMockConn())
+			defer conn.Close()
+			conn.capabilities = tt.capabilities
+			conn.maxBufferSize = tt.maxBufferSize
+
+			f := &File{session: &Session{conn: conn}}
+
+			if got := f.maxReadChunk(); got != tt.wantRead {
+				t.Errorf("maxReadChunk() = %d, want %d", got, tt.wantRead)
+			}
+			if got := f.maxWriteChunk(); got != tt.wantWrite {
+				t.Errorf("maxWriteChunk() = %d, want %d", got, tt.wantWrite)
+			}
+		})
+	}
 }
