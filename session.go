@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -174,6 +175,17 @@ func (c *Session) Logoff() error {
 //
 // The returned Share inherits the Session's context (including any logger).
 // Call Share.WithContext() if you need to use a different context for the share.
+// uncServerName returns the address to use as the server component of a UNC
+// path. The transport port must never appear there: a server-name component
+// carrying one is rejected outright with STATUS_DUPLICATE_NAME by servers that
+// parse it strictly, even though others accept it.
+func uncServerName(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
 func (c *Session) Mount(sharename string) (*Share, error) {
 	// Normalize the share name
 	sharename = normalizePath(sharename)
@@ -182,11 +194,7 @@ func (c *Session) Mount(sharename string) (*Share, error) {
 	if !strings.Contains(sharename, "\\") {
 		// Per impacket reference implementation, SMB1 tree connect should use
 		// the IP address, not the NetBIOS name
-		addr := c.addr
-		if idx := strings.LastIndex(addr, ":"); idx != -1 {
-			addr = addr[:idx]
-		}
-		sharename = fmt.Sprintf(`\\%s\%s`, addr, sharename)
+		sharename = fmt.Sprintf(`\\%s\%s`, uncServerName(c.addr), sharename)
 	}
 
 	// Ensure sharename has leading backslashes
@@ -286,7 +294,7 @@ func (c *Session) listSharenamesRAP() ([]string, error) {
 	logger.Debug("Listing shares using RAP NetShareEnum")
 
 	// Connect to IPC$ share for RAP operations
-	ipcShare, err := c.s.TreeConnect(fmt.Sprintf(`\\%s\IPC$`, c.addr), c.ctx)
+	ipcShare, err := c.s.TreeConnect(fmt.Sprintf(`\\%s\IPC$`, uncServerName(c.addr)), c.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to IPC$ share: %w", err)
 	}
@@ -346,7 +354,7 @@ func (c *Session) listSharenamesRPC() ([]string, error) {
 	logger.Debug("Listing shares using RPC/SRVSVC NetShareEnumAll")
 
 	// Connect to IPC$ share for RPC operations
-	ipcShare, err := c.s.TreeConnect(fmt.Sprintf(`\\%s\IPC$`, c.addr), c.ctx)
+	ipcShare, err := c.s.TreeConnect(fmt.Sprintf(`\\%s\IPC$`, uncServerName(c.addr)), c.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to IPC$ share: %w", err)
 	}
@@ -371,7 +379,7 @@ func (c *Session) listSharenamesRPC() ([]string, error) {
 	}
 
 	// Prepare NetShareEnumAll request
-	requestData := srvsvc.EncodeNetShareEnumAllRequest(c.addr)
+	requestData := srvsvc.EncodeNetShareEnumAllRequest(uncServerName(c.addr))
 
 	// Send RPC request
 	callID := uint32(1)

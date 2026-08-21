@@ -142,3 +142,27 @@ func TestShareWithContextNilContext(t *testing.T) {
 		t.Errorf("expected nil share for nil context, got %v", newShare)
 	}
 }
+
+func TestUNCServerName(t *testing.T) {
+	tests := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{name: "IPv4 with port", addr: "192.0.2.10:445", want: "192.0.2.10"},
+		{name: "IPv4 without port", addr: "192.0.2.10", want: "192.0.2.10"},
+		{name: "host with port", addr: "fileserver:10445", want: "fileserver"},
+		{name: "host without port", addr: "fileserver", want: "fileserver"},
+		{name: "bracketed IPv6 with port", addr: "[fe80::1]:445", want: "fe80::1"},
+		{name: "bare IPv6 is left intact", addr: "fe80::1", want: "fe80::1"},
+		{name: "empty", addr: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := uncServerName(tt.addr); got != tt.want {
+				t.Errorf("uncServerName(%q) = %q, want %q", tt.addr, got, tt.want)
+			}
+		})
+	}
+}
