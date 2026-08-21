@@ -42,6 +42,27 @@ const SMBProtocolOverhead = 1024
 // caller that resumes from it rewrites a range that is already there.
 const writeDrainTimeout = 30 * time.Second
 
+// maxPipelineDepth caps how many requests this client keeps in flight, however
+// high a server advertises its MaxMpxCount.
+const maxPipelineDepth = 50
+
+// PipelineDepth reports how many requests this client will keep in flight
+// against a server advertising maxMpxCount, and whether it will pipeline at all.
+//
+// Both answers come from here so that what the transfer paths do and what the
+// capability report says cannot drift apart. A server advertising 0 or 1 gets
+// one request at a time, which is the same thing said twice: no pipelining, and
+// a depth of one.
+func PipelineDepth(maxMpxCount uint16) (depth int, pipelines bool) {
+	if maxMpxCount <= 1 {
+		return 1, false
+	}
+	if int(maxMpxCount) > maxPipelineDepth {
+		return maxPipelineDepth, true
+	}
+	return int(maxMpxCount), true
+}
+
 // File represents an open file on the SMB share.
 type File struct {
 	session *Session   // parent session
@@ -204,8 +225,7 @@ func (f *File) Read(buf []byte, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
 
 	// Check if server supports pipelining
-	maxMpxCount := int(f.session.conn.maxMpxCount)
-	supportsPipelining := maxMpxCount > 1
+	_, supportsPipelining := PipelineDepth(f.session.conn.maxMpxCount)
 
 	// Calculate maxDataPerRead for log message
 	supportsLargeReadX := (f.session.conn.capabilities & smb1.CAP_LARGE_READX) != 0
@@ -292,16 +312,7 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 	totalSize := len(buf)
 	numChunks := (totalSize + maxDataPerRead - 1) / maxDataPerRead
 
-	// Determine pipeline depth based on server's MaxMpxCount
-	maxPipeline := int(f.session.conn.maxMpxCount)
-	if maxPipeline == 0 {
-		// Server didn't specify, use safe default
-		maxPipeline = 30
-	} else if maxPipeline > 50 {
-		// Cap at 50 for safety with servers advertising very high values
-		maxPipeline = 50
-	}
-	// Otherwise use the server's advertised MaxMpxCount
+	maxPipeline, _ := PipelineDepth(f.session.conn.maxMpxCount)
 
 	// Don't pipeline more than the number of chunks
 	if maxPipeline > numChunks {
@@ -651,8 +662,7 @@ func (f *File) Write(data []byte, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
 
 	// Check if server supports pipelining
-	maxMpxCount := int(f.session.conn.maxMpxCount)
-	supportsPipelining := maxMpxCount > 1
+	_, supportsPipelining := PipelineDepth(f.session.conn.maxMpxCount)
 
 	if !supportsPipelining || len(data) < pipelineThreshold {
 		logger.Debug("File.Write: using sequential write for %d bytes", len(data))
@@ -733,16 +743,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 	totalSize := len(data)
 	numChunks := (totalSize + maxDataPerWrite - 1) / maxDataPerWrite
 
-	// Determine pipeline depth based on server's MaxMpxCount
-	maxPipeline := int(f.session.conn.maxMpxCount)
-	if maxPipeline == 0 {
-		// Server didn't specify, use safe default
-		maxPipeline = 30
-	} else if maxPipeline > 50 {
-		// Cap at 50 for safety with servers advertising very high values
-		maxPipeline = 50
-	}
-	// Otherwise use the server's advertised MaxMpxCount
+	maxPipeline, _ := PipelineDepth(f.session.conn.maxMpxCount)
 
 	// Don't pipeline more than the number of chunks
 	if maxPipeline > numChunks {

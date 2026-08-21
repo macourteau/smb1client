@@ -592,3 +592,35 @@ func TestReceiveLogsResponseForUnknownMID(t *testing.T) {
 		}
 	}
 }
+
+// TestPipelineDepth pins the one place the transfer paths and the capability
+// report both consult, so a report of "no pipelining, depth 30" cannot come
+// back.
+func TestPipelineDepth(t *testing.T) {
+	tests := []struct {
+		name          string
+		maxMpxCount   uint16
+		wantDepth     int
+		wantPipelines bool
+	}{
+		{name: "server did not say", maxMpxCount: 0, wantDepth: 1, wantPipelines: false},
+		{name: "server cannot multiplex", maxMpxCount: 1, wantDepth: 1, wantPipelines: false},
+		{name: "smallest depth that pipelines", maxMpxCount: 2, wantDepth: 2, wantPipelines: true},
+		{name: "typical server", maxMpxCount: 50, wantDepth: 50, wantPipelines: true},
+		{name: "an implausible advertisement is capped", maxMpxCount: 65535, wantDepth: maxPipelineDepth, wantPipelines: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			depth, pipelines := PipelineDepth(tt.maxMpxCount)
+			if depth != tt.wantDepth || pipelines != tt.wantPipelines {
+				t.Errorf("PipelineDepth(%d) = (%d, %v), want (%d, %v)",
+					tt.maxMpxCount, depth, pipelines, tt.wantDepth, tt.wantPipelines)
+			}
+			if !pipelines && depth != 1 {
+				t.Errorf("PipelineDepth(%d) reports depth %d while saying it will not pipeline",
+					tt.maxMpxCount, depth)
+			}
+		})
+	}
+}
