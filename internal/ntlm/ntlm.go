@@ -20,7 +20,20 @@ var version = []byte{
 	7: NTLMSSP_REVISION_W2K3,
 }
 
-const defaultFlags = NTLMSSP_NEGOTIATE_56 | NTLMSSP_NEGOTIATE_KEY_EXCH | NTLMSSP_NEGOTIATE_128 | NTLMSSP_NEGOTIATE_TARGET_INFO | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | NTLMSSP_NEGOTIATE_ALWAYS_SIGN | NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_REQUEST_TARGET | NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_NEGOTIATE_VERSION
+// defaultFlags are the NTLM capabilities this client advertises.
+//
+// NTLMSSP_NEGOTIATE_ALWAYS_SIGN is deliberately absent. It promises a
+// signature block on every message whatever else is negotiated, and no SMB1
+// message this client sends is signed: newHeader never sets
+// SMB_FLAGS2_SMB_SECURITY_SIGNATURE and SecurityFeatures is always zero.
+//
+// NTLMSSP_NEGOTIATE_SIGN stays. It is not the same promise — it asks for
+// session-key negotiation for message signatures, and the keys it produces are
+// used, by the SPNEGO mechListMIC. It is also not optional: measured against
+// Windows 11 24H2, dropping it fails authentication outright with
+// STATUS_INVALID_PARAMETER, whether or not ALWAYS_SIGN is present. Samba
+// accepts all four combinations.
+const defaultFlags = NTLMSSP_NEGOTIATE_56 | NTLMSSP_NEGOTIATE_KEY_EXCH | NTLMSSP_NEGOTIATE_128 | NTLMSSP_NEGOTIATE_TARGET_INFO | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_REQUEST_TARGET | NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_NEGOTIATE_VERSION
 
 var le = binary.LittleEndian
 
