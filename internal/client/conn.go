@@ -255,6 +255,21 @@ func (c *Conn) awaitResponse(respCh <-chan *response, mid uint16, ctx context.Co
 
 	select {
 	case resp := <-respCh:
+		// A response with no header was synthesised to wake this waiter when
+		// the connection went away; nothing was received from the server.
+		// Handing it back would give callers a response whose header they then
+		// dereference for a status that does not exist.
+		if resp.header == nil {
+			err := resp.err
+			if err == nil {
+				err = c.connError()
+			}
+			if err == nil {
+				err = ErrConnectionClosed
+			}
+			logger.Debug("sendRecv: connection went away while waiting on MID %d: %v", mid, err)
+			return nil, err
+		}
 		if resp.err != nil {
 			logger.Debug("sendRecv: received error response for MID %d: %v", mid, resp.err)
 		} else {

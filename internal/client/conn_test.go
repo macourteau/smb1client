@@ -624,3 +624,42 @@ func TestPipelineDepth(t *testing.T) {
 		})
 	}
 }
+
+// TestSendRecvConnectionTornDownMidRequest covers the response the connection
+// synthesises to wake a waiter when it goes away. That response carries no
+// header, because nothing was received; handing it back gave callers a
+// response whose header they dereferenced for a status that did not exist,
+// and TreeConnect crashed on exactly that when a server dropped the
+// connection after session setup.
+func TestSendRecvConnectionTornDownMidRequest(t *testing.T) {
+	mockTCP := newMockConn()
+	c := NewConn(mockTCP)
+	defer c.Close()
+
+	type result struct {
+		resp *response
+		err  error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		resp, err := c.sendRecv(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background())
+		done <- result{resp, err}
+	}()
+
+	// Let the request register, then take the connection away underneath it.
+	time.Sleep(20 * time.Millisecond)
+	c.setError(errors.New("smb1: connection went away"))
+
+	select {
+	case got := <-done:
+		if got.err == nil {
+			t.Fatal("sendRecv() returned no error after the connection was torn down")
+		}
+		if got.resp != nil {
+			t.Errorf("sendRecv() returned a response alongside %v; callers dereference its header", got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendRecv() did not return after the connection was torn down")
+	}
+}
