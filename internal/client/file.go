@@ -10,6 +10,7 @@ import (
 
 	"github.com/macourteau/smb1client/internal/erref"
 	"github.com/macourteau/smb1client/internal/logging"
+	"github.com/macourteau/smb1client/internal/netbios"
 	"github.com/macourteau/smb1client/internal/smb1"
 )
 
@@ -509,7 +510,11 @@ func (f *File) sendReadRequest(chunk *readChunk, ctx context.Context) error {
 		f.session.conn.mu.Lock()
 		delete(f.session.conn.pending, mid)
 		f.session.conn.mu.Unlock()
-		f.session.conn.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		// See beginRequest: a packet that never reached the wire leaves the
+		// connection usable, so it must not be torn down here.
+		if !errors.Is(err, netbios.ErrNotSent) {
+			f.session.conn.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		}
 		return err
 	}
 
@@ -921,7 +926,11 @@ func (f *File) sendWriteRequest(chunk *writeChunk, ctx context.Context) error {
 		f.session.conn.mu.Lock()
 		delete(f.session.conn.pending, mid)
 		f.session.conn.mu.Unlock()
-		f.session.conn.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		// See beginRequest: a packet that never reached the wire leaves the
+		// connection usable, so it must not be torn down here.
+		if !errors.Is(err, netbios.ErrNotSent) {
+			f.session.conn.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		}
 		return err
 	}
 
