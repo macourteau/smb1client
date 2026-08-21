@@ -2,6 +2,7 @@ package smb1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/macourteau/smb1client/internal/client"
+	"github.com/macourteau/smb1client/internal/erref"
 	"github.com/macourteau/smb1client/internal/smb1"
 	"github.com/macourteau/smb1client/internal/srvsvc"
 )
@@ -624,12 +626,14 @@ func (fs *Share) Remove(name string) error {
 
 	f, err := fs.tree.OpenFile(name, access, sharemode, createmode, createOptions, fs.ctx)
 	if err != nil {
-		// For directories, if we get a sharing violation, it might be because a search
-		// handle from ReadDir() is still open. The server should close it eventually,
-		// so retry with increasing delays.
-		errStr := err.Error()
-		if stat.IsDir() && (strings.Contains(errStr, "share access flags are incompatible") ||
-			strings.Contains(errStr, "STATUS_SHARING_VIOLATION")) {
+		// A sharing violation on a directory means something still holds it
+		// open. This client closes its own search handles at end of search, so
+		// what is left is another client's handle, which will go away on its
+		// own schedule — retry with increasing delays rather than fail outright.
+		if stat.IsDir() && isSharingViolation(err) {
+			logger := LoggerFromContext(fs.ctx)
+			logger.Warn("Sharing violation removing directory %s, retrying: %v", name, err)
+
 			// Retry with exponential backoff (total ~5 seconds)
 			for i := 0; i < maxRemoveRetries; i++ {
 				delay := time.Duration(50*(1<<uint(i))) * time.Millisecond // 50ms, 100ms, 200ms, ...
@@ -647,10 +651,12 @@ func (fs *Share) Remove(name string) error {
 
 				f, err = fs.tree.OpenFile(name, access, sharemode, createmode, createOptions, fs.ctx)
 				if err == nil {
+					logger.Warn("Directory %s became removable after %d retries", name, i+1)
 					break
 				}
 			}
 			if err != nil {
+				logger.Error("Directory %s still held open after %d retries: %v", name, maxRemoveRetries, err)
 				return mapSMBErrorToOSError(err, "remove", name)
 			}
 			// Fall through to close and return
@@ -665,6 +671,24 @@ func (fs *Share) Remove(name string) error {
 	}
 
 	return nil
+}
+
+// isSharingViolation reports whether err carries STATUS_SHARING_VIOLATION.
+// Matching the status is what makes this reliable: the same condition reaches
+// callers with several different message texts depending on how deep it was
+// wrapped.
+func isSharingViolation(err error) bool {
+	var respErr *ResponseError
+	if errors.As(err, &respErr) {
+		return erref.NtStatus(respErr.Code) == erref.STATUS_SHARING_VIOLATION
+	}
+
+	var status erref.NtStatus
+	if errors.As(err, &status) {
+		return status == erref.STATUS_SHARING_VIOLATION
+	}
+
+	return false
 }
 
 // RemoveAll removes path and any children it contains.

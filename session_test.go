@@ -2,7 +2,12 @@ package smb1
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
 	"testing"
+
+	smb1internal "github.com/macourteau/smb1client/internal/smb1"
 )
 
 // TestShareReaddirAllEntries tests Share.Readdir with n <= 0 (return all entries)
@@ -162,6 +167,33 @@ func TestUNCServerName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := uncServerName(tt.addr); got != tt.want {
 				t.Errorf("uncServerName(%q) = %q, want %q", tt.addr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsSharingViolation(t *testing.T) {
+	sharing := smb1internal.StatusToError(0xC0000043)
+	accessDenied := smb1internal.StatusToError(0xC0000022)
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "bare status", err: sharing, want: true},
+		{name: "wrapped once", err: fmt.Errorf("smb1: nt create failed: %w", sharing), want: true},
+		{name: "wrapped twice", err: fmt.Errorf("remove: %w", fmt.Errorf("smb1: nt create failed: %w", sharing)), want: true},
+		{name: "inside a PathError", err: &os.PathError{Op: "remove", Path: "d", Err: sharing}, want: true},
+		{name: "a different status", err: accessDenied, want: false},
+		{name: "an unrelated error", err: errors.New("share access flags are incompatible"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSharingViolation(tt.err); got != tt.want {
+				t.Errorf("isSharingViolation(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
