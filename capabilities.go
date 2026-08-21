@@ -1,6 +1,10 @@
 package smb1
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/macourteau/smb1client/internal/client"
+)
 
 // ServerCapabilities contains information about the SMB server's capabilities
 // as negotiated during the protocol handshake.
@@ -25,7 +29,9 @@ type ServerCapabilities struct {
 	SupportsPipelining bool
 
 	// EffectivePipelineDepth is the actual pipeline depth that will be used
-	// by this client implementation, capped at 50 for safety.
+	// by this client implementation, capped at 50 for safety. It is 1 when
+	// SupportsPipelining is false, since the client then issues one request at
+	// a time.
 	EffectivePipelineDepth int
 }
 
@@ -56,17 +62,9 @@ func (c ServerCapabilities) String() string {
 func (s *Session) Capabilities() ServerCapabilities {
 	maxMpx, maxBuf, serverName, domainName := s.conn.GetCapabilities()
 
-	// Calculate effective pipeline depth using same logic as file.go
-	effectiveDepth := int(maxMpx)
-	if effectiveDepth == 0 {
-		// Server didn't specify, use safe default
-		effectiveDepth = 30
-	} else if effectiveDepth > 50 {
-		// Cap at 50 for safety with servers advertising very high values
-		effectiveDepth = 50
-	}
-
-	supportsPipelining := maxMpx > 1
+	// Ask the transfer paths what they will do rather than restating it, so a
+	// report of "no pipelining, depth 30" cannot arise again.
+	effectiveDepth, supportsPipelining := client.PipelineDepth(maxMpx)
 
 	return ServerCapabilities{
 		MaxMpxCount:            maxMpx,
