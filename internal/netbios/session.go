@@ -23,6 +23,16 @@ import (
 // data, and a caller testing for io.EOF would draw the opposite conclusion.
 var ErrConnectionClosed = fmt.Errorf("netbios: connection closed: %w", net.ErrClosed)
 
+// ErrNotSent reports that a packet was abandoned before any of its bytes
+// reached the connection, because the caller's context was already done.
+//
+// The distinction matters to the layer above: nothing was written, so the byte
+// stream is still intact and the connection remains usable by every other
+// request multiplexed onto it. A write that fails part way through is a
+// different thing entirely — the stream is then in an unknown state and the
+// connection has to be torn down.
+var ErrNotSent = errors.New("netbios: packet not sent")
+
 // isHangup reports whether err means the peer went away mid-frame.
 //
 // io.ReadFull distinguishes two shapes that are the same event: it answers a
@@ -218,10 +228,12 @@ func (s *Session) WritePacketContext(ctx context.Context, data []byte) error {
 func (s *Session) writePacketType(ctx context.Context, msgType byte, data []byte) error {
 	logger := logging.FromContext(ctx)
 
-	// Check context before starting
+	// Check context before starting. Nothing has been written at this point,
+	// so the failure is reported as ErrNotSent: the connection is untouched and
+	// must not be torn down on account of it.
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("%w: %w", ErrNotSent, ctx.Err())
 	default:
 	}
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -393,7 +394,12 @@ func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx contex
 
 	if err := c.netbiosConn.WritePacketContext(ctx, packet); err != nil {
 		cleanup()
-		c.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		// A packet abandoned before it was written leaves the stream intact,
+		// so the connection stays usable for everything else multiplexed onto
+		// it. Only a write that actually failed poisons it.
+		if !errors.Is(err, netbios.ErrNotSent) {
+			c.setError(fmt.Errorf("smb1: failed to send packet: %w", err))
+		}
 		return nil, 0, nil, err
 	}
 

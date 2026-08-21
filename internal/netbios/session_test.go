@@ -395,8 +395,17 @@ func TestWritePacketContext_Cancellation(t *testing.T) {
 	cancel()
 
 	err := session.WritePacketContext(ctx, []byte("test"))
-	if err != context.Canceled {
-		t.Errorf("WritePacketContext() with cancelled context should return context.Canceled, got %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("WritePacketContext() with cancelled context should wrap context.Canceled, got %v", err)
+	}
+
+	// The caller has to be able to tell that nothing reached the wire, because
+	// that is what decides whether the connection is still usable.
+	if !errors.Is(err, ErrNotSent) {
+		t.Errorf("WritePacketContext() error = %v, want it to wrap ErrNotSent", err)
+	}
+	if n := conn.writeBuf.Len(); n != 0 {
+		t.Errorf("WritePacketContext() wrote %d bytes for a cancelled context, want 0", n)
 	}
 }
 

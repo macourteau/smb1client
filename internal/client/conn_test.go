@@ -458,3 +458,41 @@ func TestSendAfterClose(t *testing.T) {
 		t.Error("send after close should return error")
 	}
 }
+
+// TestBeginRequestCancelledContextLeavesConnectionUsable covers the difference
+// between a packet that failed to write and one that was never written.
+//
+// A cancelled context is noticed before any bytes reach the connection, so the
+// byte stream is intact and every other request multiplexed onto that
+// connection must keep working. Treating it as a transport failure tore the
+// whole connection down, and an unrelated operation on an uncancelled context
+// failed immediately afterwards.
+func TestBeginRequestCancelledContextLeavesConnectionUsable(t *testing.T) {
+	mockTCP := newMockConn()
+	c := NewConn(mockTCP)
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	header := smb1.NewHeader(smb1.SMB_COM_ECHO)
+	_, _, _, err := c.beginRequest(header, nil, nil, ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("beginRequest() error = %v, want it to wrap context.Canceled", err)
+	}
+
+	select {
+	case <-c.done:
+		t.Fatal("beginRequest() tore down the connection for a packet that was never sent")
+	default:
+	}
+
+	if c.err != nil {
+		t.Errorf("connection error = %v, want nil after a cancelled request", c.err)
+	}
+
+	// The connection must still accept work on a live context.
+	if _, _, _, err := c.beginRequest(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background()); err != nil {
+		t.Errorf("beginRequest() on a live context after a cancelled one failed: %v", err)
+	}
+}
