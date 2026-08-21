@@ -78,6 +78,13 @@ const (
 	SESSION_SETUP_GUEST uint16 = 0x0001 // User logged in as guest
 )
 
+// sessionSetupByteAreaOffset is where an SMB_COM_SESSION_SETUP_ANDX request's
+// byte area begins, counted from the start of the SMB header: the header, the
+// WordCount byte, twelve parameter words, and the two-byte ByteCount. It is
+// odd, which is what makes the alignment of any UTF-16 string inside it depend
+// on where the area starts rather than only on how much has been written.
+const sessionSetupByteAreaOffset = HeaderSize + 1 + 24 + 2
+
 // EncodeSessionSetupRequest encodes an SMB_COM_SESSION_SETUP_ANDX request.
 // Returns parameters and data sections.
 func EncodeSessionSetupRequest(req *SessionSetupRequest) ([]byte, []byte, error) {
@@ -112,8 +119,13 @@ func EncodeSessionSetupRequest(req *SessionSetupRequest) ([]byte, []byte, error)
 		data = append(data, req.SecurityBlob...)
 	}
 
-	// Padding for alignment (if using Unicode, data should be word-aligned)
-	if req.UseUnicode && len(data)%2 != 0 {
+	// A UTF-16 string in the byte area has to start on a two-byte boundary
+	// measured from the start of the SMB header, not from the start of the byte
+	// area. This request's byte area begins at an odd offset
+	// (sessionSetupByteAreaOffset), so aligning within the byte area alone puts
+	// every string one byte out: Samba read "Unix" back as "渀椀砀", which is
+	// the same bytes started one early.
+	if req.UseUnicode && (sessionSetupByteAreaOffset+len(data))%2 != 0 {
 		data = append(data, 0)
 	}
 
