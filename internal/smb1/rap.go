@@ -3,6 +3,8 @@ package smb1
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/macourteau/smb1client/internal/utf16le"
 )
 
 // RAP (Remote Administration Protocol) constants and structures.
@@ -264,38 +266,80 @@ func parseNullTerminatedString(data []byte) (string, error) {
 	return "", fmt.Errorf("smb1: no null terminator found in string")
 }
 
+// TransactNamedPipeName is the Name field [MS-CIFS] requires on a
+// TRANS_TRANSACT_NMPIPE request. The pipe itself is identified by the FID in
+// the setup words; this names the transaction's target class.
+const TransactNamedPipeName = `\PIPE\`
+
+// RAPPipeName is the named pipe RAP requests are addressed to.
+const RAPPipeName = `\PIPE\LANMAN`
+
+// transactionByteAreaOffset is where a TRANSACTION request's byte area begins,
+// counted from the start of the SMB header: the header, the WordCount byte, the
+// fourteen fixed parameter words, two setup words, and the two-byte ByteCount.
+//
+// It is odd, which is the whole difficulty here. Every alignment boundary in an
+// SMB message is measured from the header, so where a UTF-16 string may start,
+// and where the parameter and data blocks land after it, all depend on this
+// offset rather than only on how much has been written into the area.
+const transactionByteAreaOffset = HeaderSize + 1 + 28 + 4 + 2
+
+// encodeSMBString encodes a null-terminated SMB_STRING.
+//
+// The header's SMB_FLAGS2_UNICODE bit governs every string in a message, so the
+// width is the caller's to decide and not each field's. Writing one of them as
+// 8-bit text under a Unicode header does not merely look wrong: the server
+// reads the bytes two at a time and matches nothing.
+func encodeSMBString(s string, useUnicode bool) []byte {
+	if useUnicode {
+		return append(utf16le.EncodeStringToBytes(s), 0, 0)
+	}
+	return append([]byte(s), 0)
+}
+
+// buildTransactionByteArea lays out a TRANSACTION request's byte area — the
+// pipe name, then the parameter bytes, then the data bytes — and returns the
+// offsets the fixed parameter block must advertise for the last two.
+//
+// Lengthening the name moves everything after it, so the offsets are derived
+// from the layout as it is built rather than computed separately.
+func buildTransactionByteArea(name string, params, data []byte, useUnicode bool) (byteArea []byte, paramOffset, dataOffset uint16) {
+	pad := func(area []byte) []byte {
+		if (transactionByteAreaOffset+len(area))%2 != 0 {
+			return append(area, 0)
+		}
+		return area
+	}
+
+	area := []byte{}
+	if useUnicode {
+		// The name is UTF-16 here, so it must start on a two-byte boundary.
+		area = pad(area)
+	}
+	area = append(area, encodeSMBString(name, useUnicode)...)
+
+	area = pad(area)
+	paramOffset = uint16(transactionByteAreaOffset + len(area))
+	area = append(area, params...)
+
+	area = pad(area)
+	dataOffset = uint16(transactionByteAreaOffset + len(area))
+	area = append(area, data...)
+
+	return area, paramOffset, dataOffset
+}
+
 // EncodeTransactionRequest encodes a TRANSACTION request (not TRANS2).
 // This is used for RAP requests via \PIPE\LANMAN.
 //
 // The transaction request format is similar to TRANS2 but uses a different
 // command (SMB_COM_TRANSACTION) and has a Name field for the pipe name.
-func EncodeTransactionRequest(name string, params, data []byte, maxDataCount uint16) ([]byte, []byte, error) {
+func EncodeTransactionRequest(name string, params, data []byte, maxDataCount uint16, useUnicode bool) ([]byte, []byte, error) {
 	// Calculate sizes
 	paramCount := uint16(len(params))
 	dataCount := uint16(len(data))
 
-	// Name should be null-terminated ASCII string for pipe name
-	nameBytes := []byte(name + "\x00")
-
-	// Calculate offsets (similar to TRANS2)
-	// Structure: SMBHeader(32) + WordCount(1) + FixedParams(28) + SetupWords(4) + ByteCount(2) + Name + Padding
-	headerAndParamsSize := HeaderSize + 1 + 28 + 4 + 2 + len(nameBytes)
-
-	// Align to word boundary for parameters
-	pad1Size := 0
-	if headerAndParamsSize%2 != 0 {
-		pad1Size = 1
-	}
-
-	paramOffset := uint16(headerAndParamsSize + pad1Size)
-
-	// Data starts after parameters with padding
-	pad2Size := 0
-	if (paramOffset+paramCount)%2 != 0 {
-		pad2Size = 1
-	}
-
-	dataOffset := paramOffset + paramCount + uint16(pad2Size)
+	dataSection, paramOffset, dataOffset := buildTransactionByteArea(name, params, data, useUnicode)
 
 	// Encode fixed parameters (14 words = 28 bytes, plus 2 setup words)
 	fixedParams := make([]byte, 28)
@@ -324,38 +368,21 @@ func EncodeTransactionRequest(name string, params, data []byte, maxDataCount uin
 	// Combine fixed params and setup into parameters section
 	allParams := append(fixedParams, setupBytes...)
 
-	// Build data section: Name + Pad1 + Parameters + Pad2 + Data
-	dataSection := make([]byte, 0, len(nameBytes)+pad1Size+len(params)+pad2Size+len(data))
-	dataSection = append(dataSection, nameBytes...)
-	for i := 0; i < pad1Size; i++ {
-		dataSection = append(dataSection, 0)
-	}
-	dataSection = append(dataSection, params...)
-	for i := 0; i < pad2Size; i++ {
-		dataSection = append(dataSection, 0)
-	}
-	dataSection = append(dataSection, data...)
-
 	return allParams, dataSection, nil
 }
 
 // EncodeTransactNamedPipeRequest encodes a TRANSACTION request for TransactNamedPipe (0x0026).
 // This is used for RPC operations over named pipes.
 // Unlike EncodeTransactionRequest which uses pipe names for RAP, this uses a FID.
-func EncodeTransactNamedPipeRequest(fid uint16, data []byte, maxDataCount uint16) ([]byte, []byte, error) {
+func EncodeTransactNamedPipeRequest(fid uint16, data []byte, maxDataCount uint16, useUnicode bool) ([]byte, []byte, error) {
 	// Calculate sizes
 	paramCount := uint16(0) // No parameters for TransactNamedPipe
 	dataCount := uint16(len(data))
 
-	// Calculate offsets (similar to TRANS2)
-	// Structure: SMBHeader(32) + WordCount(1) + FixedParams(28) + SetupWords(4) + ByteCount(2) + Data
-	// For TransactNamedPipe, there's no name field and no parameters
-	baseSize := HeaderSize + 1 + 28 + 4 + 2
-
-	// Data offset is right after the header/params
-	// Since there are no parameters, paramOffset is 0 and dataOffset points to start of data
-	paramOffset := uint16(0) // No parameters
-	dataOffset := uint16(baseSize)
+	// [MS-CIFS] requires the Name field of a named pipe transaction to carry
+	// TransactNamedPipeName. Sending nothing there is only invisible while the
+	// server rejects the request for some earlier reason.
+	dataSection, paramOffset, dataOffset := buildTransactionByteArea(TransactNamedPipeName, nil, data, useUnicode)
 
 	// Encode fixed parameters (14 words = 28 bytes, plus 2 setup words)
 	fixedParams := make([]byte, 28)
@@ -385,9 +412,6 @@ func EncodeTransactNamedPipeRequest(fid uint16, data []byte, maxDataCount uint16
 
 	// Combine fixed params and setup into parameters section
 	allParams := append(fixedParams, setupBytes...)
-
-	// Data section: just the transaction data (no name field for TransactNamedPipe)
-	dataSection := data
 
 	return allParams, dataSection, nil
 }

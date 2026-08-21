@@ -3,6 +3,7 @@ package smb1
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -395,7 +396,7 @@ func TestEncodeTransactionRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allParams, dataSection, err := EncodeTransactionRequest(tt.pipeName, tt.params, tt.data, 4096)
+			allParams, dataSection, err := EncodeTransactionRequest(tt.pipeName, tt.params, tt.data, 4096, false)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("EncodeTransactionRequest() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -455,6 +456,96 @@ func TestShareTypeConstants(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.value != tt.want {
 				t.Errorf("%s = 0x%04X, want 0x%04X", tt.name, tt.value, tt.want)
+			}
+		})
+	}
+}
+
+// TestEncodeTransactionRequestName covers the transaction Name field, which is
+// an SMB_STRING and so follows the header's SMB_FLAGS2_UNICODE bit.
+//
+// Written as 8-bit text under a Unicode header, a conforming server reads the
+// bytes two at a time and matches nothing: Samba logged \PIPE\LANMAN as
+// <䥐䕐䱜乁䅍N> and answered STATUS_NOT_SUPPORTED, so RAP never worked.
+//
+// The offsets are asserted against frames captured from a server that accepted
+// the request, because a name that encodes plausibly but lands on the wrong
+// boundary fails the same way.
+func TestEncodeTransactionRequestName(t *testing.T) {
+	// The RAP NetShareEnum request that produced the captures.
+	params := make([]byte, 19)
+
+	tests := []struct {
+		name            string
+		useUnicode      bool
+		wantParamOffset uint16
+		wantDataOffset  uint16
+		wantByteCount   int
+	}{
+		{name: "ASCII name", useUnicode: false, wantParamOffset: 80, wantDataOffset: 100, wantByteCount: 33},
+		{name: "UTF-16LE name", useUnicode: true, wantParamOffset: 94, wantDataOffset: 114, wantByteCount: 47},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allParams, dataSection, err := EncodeTransactionRequest(RAPPipeName, params, nil, 4096, tt.useUnicode)
+			if err != nil {
+				t.Fatalf("EncodeTransactionRequest() error = %v", err)
+			}
+
+			if got := binary.LittleEndian.Uint16(allParams[20:22]); got != tt.wantParamOffset {
+				t.Errorf("ParameterOffset = %d, want %d", got, tt.wantParamOffset)
+			}
+			if got := binary.LittleEndian.Uint16(allParams[24:26]); got != tt.wantDataOffset {
+				t.Errorf("DataOffset = %d, want %d", got, tt.wantDataOffset)
+			}
+			if len(dataSection) != tt.wantByteCount {
+				t.Errorf("ByteCount = %d, want %d", len(dataSection), tt.wantByteCount)
+			}
+
+			// The name must be readable by a server decoding it the way the
+			// header's flags say to.
+			wantName := encodeSMBString(RAPPipeName, tt.useUnicode)
+			if !bytes.Contains(dataSection, wantName) {
+				t.Errorf("the byte area does not carry %q encoded for useUnicode=%v", RAPPipeName, tt.useUnicode)
+			}
+
+			// The advertised offsets have to point at what was actually written.
+			paramStart := int(tt.wantParamOffset) - transactionByteAreaOffset
+			if !bytes.Equal(dataSection[paramStart:paramStart+len(params)], params) {
+				t.Error("ParameterOffset does not point at the parameter bytes")
+			}
+		})
+	}
+}
+
+// TestEncodeTransactNamedPipeRequestCarriesName covers the Name [MS-CIFS]
+// requires on a named pipe transaction. Sending nothing there was invisible
+// only while the server rejected the request for the Name-encoding defect
+// first.
+func TestEncodeTransactNamedPipeRequestCarriesName(t *testing.T) {
+	payload := []byte{0x05, 0x00, 0x0b, 0x03} // start of a DCE/RPC bind
+
+	for _, useUnicode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("useUnicode_%v", useUnicode), func(t *testing.T) {
+			allParams, dataSection, err := EncodeTransactNamedPipeRequest(0x2A, payload, 4096, useUnicode)
+			if err != nil {
+				t.Fatalf("EncodeTransactNamedPipeRequest() error = %v", err)
+			}
+
+			wantName := encodeSMBString(TransactNamedPipeName, useUnicode)
+			if !bytes.Contains(dataSection, wantName) {
+				t.Fatalf("the byte area does not carry %q; it begins %x", TransactNamedPipeName, dataSection[:8])
+			}
+
+			dataOffset := binary.LittleEndian.Uint16(allParams[24:26])
+			if useUnicode && dataOffset%2 != 0 {
+				t.Errorf("DataOffset = %d, which is odd under a Unicode header", dataOffset)
+			}
+
+			start := int(dataOffset) - transactionByteAreaOffset
+			if !bytes.Equal(dataSection[start:start+len(payload)], payload) {
+				t.Error("DataOffset does not point at the payload")
 			}
 		})
 	}
