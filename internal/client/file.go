@@ -1434,9 +1434,12 @@ func (f *File) readdirAll(tree *Tree, searchPattern string, ctx context.Context)
 			SearchCount:      100,
 			InformationLevel: smb1.SMB_FIND_FILE_BOTH_DIRECTORY_INFO,
 			ResumeKey:        0,
-			Flags:            smb1.SMB_FIND_CONTINUE_FROM_LAST,
-			FileName:         searchPattern,
-			UseUnicode:       (tree.GetCapabilities() & smb1.CAP_UNICODE) != 0,
+			// See the matching FIND_NEXT2 in the public ReadDir: the
+			// close-at-end-of-search flag must ride on every request, or a
+			// directory larger than one batch leaks its search handle.
+			Flags:      smb1.SMB_FIND_CONTINUE_FROM_LAST | smb1.SMB_FIND_CLOSE_AT_EOS,
+			FileName:   searchPattern,
+			UseUnicode: (tree.GetCapabilities() & smb1.CAP_UNICODE) != 0,
 		}
 
 		params2, err := smb1.EncodeFindNext2(findNextReq)

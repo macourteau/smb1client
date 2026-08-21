@@ -1109,3 +1109,67 @@ func TestSession_ListSharenames(t *testing.T) {
 		t.Error("Expected IPC$ share not found in list")
 	}
 }
+
+// TestDir_RemoveAfterListingLargeDirectory covers the search handle a paged
+// directory listing leaves behind. A directory answered by a single FIND_FIRST2
+// always closed cleanly; one large enough to need a FIND_NEXT2 did not, and the
+// open search then blocked deleting the directory it had just walked.
+//
+// The sizes straddle the batch size deliberately: the small case passed even
+// with the handle leaking, so only the large one is a regression test.
+func TestDir_RemoveAfterListingLargeDirectory(t *testing.T) {
+	session, cleanupSession := createTestSession(t)
+	defer cleanupSession()
+
+	share, cleanupShare := mountTestShare(t, session)
+	defer cleanupShare()
+
+	// One batch is 100 entries.
+	for _, entries := range []int{50, 250} {
+		t.Run(fmt.Sprintf("%d_entries", entries), func(t *testing.T) {
+			dir := fmt.Sprintf("listremove_%d_%d", entries, time.Now().UnixNano())
+
+			if err := share.Mkdir(dir, 0755); err != nil {
+				t.Fatalf("Mkdir(%q) failed: %v", dir, err)
+			}
+			defer share.RemoveAll(dir)
+
+			for i := 0; i < entries; i++ {
+				name := fmt.Sprintf("%s\\entry-%04d.txt", dir, i)
+				if err := share.WriteFile(name, []byte("x"), 0644); err != nil {
+					t.Fatalf("WriteFile(%q) failed: %v", name, err)
+				}
+			}
+
+			listed, err := share.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir(%q) failed: %v", dir, err)
+			}
+			if len(listed) != entries {
+				t.Fatalf("ReadDir(%q) returned %d entries, want %d", dir, len(listed), entries)
+			}
+
+			// Removing in the same session is the point: a fresh session would
+			// not see the leaked handle.
+			start := time.Now()
+			if err := share.RemoveAll(dir); err != nil {
+				t.Fatalf("RemoveAll(%q) after listing failed: %v", dir, err)
+			}
+
+			// The removal retries on a sharing violation with a backoff that
+			// starts at 50ms, so a leaked handle shows up as elapsed time even
+			// when the retries eventually win.
+			if elapsed := time.Since(start); elapsed > 30*time.Second {
+				t.Errorf("RemoveAll(%q) took %v, which means the search handle was still open", dir, elapsed)
+			}
+
+			exists, err := share.Exists(dir)
+			if err != nil {
+				t.Fatalf("Exists(%q) failed: %v", dir, err)
+			}
+			if exists {
+				t.Errorf("directory %q still exists after RemoveAll", dir)
+			}
+		})
+	}
+}
