@@ -3,6 +3,7 @@ package smb1
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/macourteau/smb1client/internal/utf16le"
 )
@@ -236,11 +237,52 @@ type FileBothDirectoryInfo struct {
 	FileName        string   // Long file name
 }
 
+// TransactionMaxParameterCount is the MaxParameterCount a TRANS2 or TRANSACTION
+// request advertises. Every subcommand this package issues returns at most ten
+// parameter bytes, so the value is generous by a wide margin; it is counted
+// against the reply budget rather than assumed free.
+const TransactionMaxParameterCount = 1024
+
+// transactionResponseOverhead is what a TRANS2 or TRANSACTION reply spends
+// before its data section: the SMB header, the fixed response words, the byte
+// count and worst-case alignment padding.
+const transactionResponseOverhead = 64
+
+// minTransactionDataCount keeps a pathological negotiated buffer from producing
+// a MaxDataCount too small to carry a directory entry. SMB1's smallest legal
+// buffer is 4356 bytes, so this floor is unreachable against a conforming
+// server.
+const minTransactionDataCount = 1024
+
+// MaxTransactionDataCount returns the MaxDataCount a TRANS2 or TRANSACTION
+// request may advertise on a session that negotiated maxBufferSize, given the
+// maxParameterCount that same request asks for.
+//
+// [MS-CIFS] allows MaxDataCount to exceed the negotiated buffer, since a server
+// may split a large reply across several messages. Windows does not accept
+// that: asked for more reply data than one buffer holds, it answers
+// STATUS_INSUFF_SERVER_RESOURCES. Windows also negotiates the 4356-byte SMB1
+// minimum, so an unclamped request fails every directory listing, stat and
+// Statfs against it. Clamping costs extra round trips against servers that
+// would have fragmented instead, and works everywhere.
+func MaxTransactionDataCount(maxBufferSize uint32, maxParameterCount uint16) uint16 {
+	budget := int64(maxBufferSize) - transactionResponseOverhead - int64(maxParameterCount)
+	switch {
+	case budget < minTransactionDataCount:
+		return minTransactionDataCount
+	case budget > math.MaxUint16:
+		return math.MaxUint16
+	default:
+		return uint16(budget)
+	}
+}
+
 // EncodeTrans2Request encodes a TRANS2 request structure.
 // The setup array contains the subcommand code and optional FID.
 // The params and data are the subcommand-specific parameters and data.
 // The name is typically empty for most TRANS2 commands.
-func EncodeTrans2Request(setup []uint16, params, data []byte, name string) ([]byte, []byte, error) {
+// maxDataCount is the reply budget to advertise; see MaxTransactionDataCount.
+func EncodeTrans2Request(setup []uint16, params, data []byte, name string, maxDataCount uint16) ([]byte, []byte, error) {
 	if len(setup) == 0 {
 		return nil, nil, fmt.Errorf("smb1: setup array cannot be empty")
 	}
@@ -279,10 +321,10 @@ func EncodeTrans2Request(setup []uint16, params, data []byte, name string) ([]by
 
 	// Encode fixed parameters (15 words = 30 bytes, but excludes setup)
 	fixedParams := make([]byte, 28)
-	binary.LittleEndian.PutUint16(fixedParams[0:2], paramCount)    // TotalParameterCount
-	binary.LittleEndian.PutUint16(fixedParams[2:4], dataCount)     // TotalDataCount
-	binary.LittleEndian.PutUint16(fixedParams[4:6], 1024)          // MaxParameterCount
-	binary.LittleEndian.PutUint16(fixedParams[6:8], 65535)         // MaxDataCount
+	binary.LittleEndian.PutUint16(fixedParams[0:2], paramCount) // TotalParameterCount
+	binary.LittleEndian.PutUint16(fixedParams[2:4], dataCount)  // TotalDataCount
+	binary.LittleEndian.PutUint16(fixedParams[4:6], TransactionMaxParameterCount)
+	binary.LittleEndian.PutUint16(fixedParams[6:8], maxDataCount)
 	fixedParams[8] = 0                                             // MaxSetupCount
 	fixedParams[9] = 0                                             // Reserved1
 	binary.LittleEndian.PutUint16(fixedParams[10:12], 0)           // Flags
