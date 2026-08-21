@@ -140,7 +140,7 @@ func TestFileFsSizeInfoMapping(t *testing.T) {
 
 	// The go-smb2 capacity formula must land on the real byte figure.
 	if total := info.TotalBlockCount() * info.FragmentSize() * info.BlockSize(); total != 32<<30 {
-		t.Errorf("capacity via go-smb2 formula = %d, want %d", total, 32<<30)
+		t.Errorf("capacity via go-smb2 formula = %d, want %d", total, uint64(32<<30))
 	}
 }
 

@@ -707,7 +707,7 @@ func TestLargeFileSupport(t *testing.T) {
 	fullOffset := uint64(offsetLow) | (uint64(offsetHigh) << 32)
 
 	if fullOffset != 0x123456789ABC {
-		t.Errorf("encoded offset = 0x%X, want 0x%X", fullOffset, 0x123456789ABC)
+		t.Errorf("encoded offset = 0x%X, want 0x%X", fullOffset, uint64(0x123456789ABC))
 	}
 
 	// Test write with large offset
@@ -735,6 +735,6 @@ func TestLargeFileSupport(t *testing.T) {
 	fullOffset = uint64(offsetLow) | (uint64(offsetHigh) << 32)
 
 	if fullOffset != 0xFEDCBA987654 {
-		t.Errorf("encoded offset = 0x%X, want 0x%X", fullOffset, 0xFEDCBA987654)
+		t.Errorf("encoded offset = 0x%X, want 0x%X", fullOffset, uint64(0xFEDCBA987654))
 	}
 }
