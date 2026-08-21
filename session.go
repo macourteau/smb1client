@@ -923,10 +923,15 @@ func (fs *Share) ReadDir(dirname string) ([]os.FileInfo, error) {
 			SID:              sid,
 			SearchCount:      findRequestBatchSize, // Request entries in batches for optimal performance
 			InformationLevel: smb1.SMB_FIND_FILE_BOTH_DIRECTORY_INFO,
-			ResumeKey:        0,                                // Server will continue from last position
-			Flags:            smb1.SMB_FIND_CONTINUE_FROM_LAST, // Continue, but don't auto-close
-			FileName:         searchPattern,
-			UseUnicode:       (fs.tree.GetCapabilities() & smb1.CAP_UNICODE) != 0,
+			ResumeKey:        0, // Server will continue from last position
+			// Continue from the server's own position, and ask it to release
+			// the search when the walk reaches end of search. The flag has to
+			// ride on every request, not just FIND_FIRST2: a directory larger
+			// than one batch ends on a FIND_NEXT2, and a search left open
+			// blocks deletion of the directory it is walking.
+			Flags:      smb1.SMB_FIND_CONTINUE_FROM_LAST | smb1.SMB_FIND_CLOSE_AT_EOS,
+			FileName:   searchPattern,
+			UseUnicode: (fs.tree.GetCapabilities() & smb1.CAP_UNICODE) != 0,
 		}
 
 		params2, err := smb1.EncodeFindNext2(findNextReq)
