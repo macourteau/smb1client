@@ -1,8 +1,12 @@
 package smb1
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
+
+	"github.com/macourteau/smb1client/internal/utf16le"
 )
 
 func TestEncodeSessionSetupRequest(t *testing.T) {
@@ -404,5 +408,55 @@ func TestSessionSetupUnicodeRoundTrip(t *testing.T) {
 	}
 	if resp.NativeLanMan != "" {
 		t.Errorf("NativeLanMan = %q, want %q", resp.NativeLanMan, "")
+	}
+}
+
+// TestEncodeSessionSetupRequestUnicodeAlignment covers where a UTF-16 string
+// in the byte area has to begin.
+//
+// The boundary is measured from the start of the SMB header, and this
+// request's byte area begins at an odd offset, so padding to an even position
+// within the byte area alone puts every string exactly one byte out. A server
+// then reads the correct bytes starting one early: Samba logged "Unix" as
+// "渀椀砀". The security blob's length decides the parity, so both cases have
+// to work.
+func TestEncodeSessionSetupRequestUnicodeAlignment(t *testing.T) {
+	for _, blobLen := range []int{0, 1, 2, 3, 16, 17} {
+		t.Run(fmt.Sprintf("blob_%d_bytes", blobLen), func(t *testing.T) {
+			blob := make([]byte, blobLen)
+			for i := range blob {
+				blob[i] = 0xAA
+			}
+
+			req := &SessionSetupRequest{
+				AndXCommand:        SMB_COM_NO_ANDX_COMMAND,
+				MaxBufferSize:      16644,
+				SecurityBlobLength: uint16(blobLen),
+				SecurityBlob:       blob,
+				NativeOS:           "Unix",
+				NativeLanMan:       "smb1client",
+				UseUnicode:         true,
+			}
+
+			_, data, err := EncodeSessionSetupRequest(req)
+			if err != nil {
+				t.Fatalf("EncodeSessionSetupRequest() error = %v", err)
+			}
+
+			want := utf16le.EncodeStringToBytes("Unix")
+			start := bytes.Index(data, want)
+			if start < 0 {
+				t.Fatalf("the encoded NativeOS string is not in the byte area at all")
+			}
+
+			if absolute := sessionSetupByteAreaOffset + start; absolute%2 != 0 {
+				t.Errorf("NativeOS begins at absolute offset %d, which is odd; a server reads it one byte early", absolute)
+			}
+
+			// Everything after the blob and its padding must decode cleanly.
+			if got := utf16le.DecodeToString(data[start : start+len(want)]); got != "Unix" {
+				t.Errorf("NativeOS decodes as %q, want %q", got, "Unix")
+			}
+		})
 	}
 }
