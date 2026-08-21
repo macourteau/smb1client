@@ -1245,3 +1245,82 @@ func TestEncodeTrans2RequestAdvertisesCallerBudget(t *testing.T) {
 		t.Errorf("MaxParameterCount = %d, want %d", got, TransactionMaxParameterCount)
 	}
 }
+
+// entryWithNextOffset builds a single FileBothDirectoryInfo entry carrying the
+// given file name and NextEntryOffset, padded to entryLen bytes.
+func entryWithNextOffset(t *testing.T, name string, nextEntryOffset uint32, entryLen int) []byte {
+	t.Helper()
+
+	nameBytes := utf16le.EncodeStringToBytes(name)
+	if entryLen < fileBothDirectoryInfoFixedSize+len(nameBytes) {
+		t.Fatalf("entryLen %d too small for name %q", entryLen, name)
+	}
+
+	entry := make([]byte, entryLen)
+	binary.LittleEndian.PutUint32(entry[0:4], nextEntryOffset)
+	binary.LittleEndian.PutUint32(entry[60:64], uint32(len(nameBytes)))
+	copy(entry[fileBothDirectoryInfoFixedSize:], nameBytes)
+	return entry
+}
+
+// TestParseFileBothDirectoryInfoChainTermination covers the two ways a server
+// may end a directory chain. Some zero the last entry's NextEntryOffset; others
+// leave it pointing past the end and rely on the reply's data length alone.
+// Both must yield the same entries.
+func TestParseFileBothDirectoryInfoChainTermination(t *testing.T) {
+	const entryLen = 112
+
+	tests := []struct {
+		name          string
+		lastNextEntry uint32
+		wantNames     []string
+		wantTruncated bool
+	}{
+		{
+			name:          "chain is zero-terminated",
+			lastNextEntry: 0,
+			wantNames:     []string{"alpha.txt", "beta.bin"},
+		},
+		{
+			name:          "chain is bounded by the data length only",
+			lastNextEntry: entryLen,
+			wantNames:     []string{"alpha.txt", "beta.bin"},
+		},
+		{
+			name:          "an offset that does not clear the current entry is rejected",
+			lastNextEntry: 8,
+			wantNames:     []string{"alpha.txt", "beta.bin"},
+			wantTruncated: true,
+		},
+		{
+			name:          "an offset past the reply ends the walk without going negative",
+			lastNextEntry: 0xFFFFFFFF - 4,
+			wantNames:     []string{"alpha.txt", "beta.bin"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := append(
+				entryWithNextOffset(t, "alpha.txt", entryLen, entryLen),
+				entryWithNextOffset(t, "beta.bin", tt.lastNextEntry, entryLen)...,
+			)
+
+			result, err := ParseFileBothDirectoryInfo(data)
+			if err != nil {
+				t.Fatalf("ParseFileBothDirectoryInfo() error = %v", err)
+			}
+			if len(result.Files) != len(tt.wantNames) {
+				t.Fatalf("parsed %d entries, want %d", len(result.Files), len(tt.wantNames))
+			}
+			for i, want := range tt.wantNames {
+				if got := result.Files[i].FileName; got != want {
+					t.Errorf("entry %d name = %q, want %q", i, got, want)
+				}
+			}
+			if result.Truncated != tt.wantTruncated {
+				t.Errorf("Truncated = %v, want %v", result.Truncated, tt.wantTruncated)
+			}
+		})
+	}
+}
