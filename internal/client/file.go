@@ -1437,7 +1437,8 @@ func (f *File) TransactNamedPipe(data []byte, ctx context.Context) ([]byte, erro
 
 	// First, try the proper SMB TransactNamedPipe function (0x0026)
 	allParams, dataBytes, err := smb1.EncodeTransactNamedPipeRequest(f.fid, data,
-		f.session.conn.transactionMaxDataCount(0))
+		f.session.conn.transactionMaxDataCount(0),
+		(f.session.conn.capabilities&smb1.CAP_UNICODE) != 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode TransactNamedPipe request: %w", err)
 	}

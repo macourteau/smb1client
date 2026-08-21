@@ -319,10 +319,10 @@ func (c *Session) listSharenamesRAP() ([]string, error) {
 		return nil, fmt.Errorf("failed to encode NetShareEnum request: %w", err)
 	}
 
-	logger.Debug("Sending RAP NetShareEnum request to \\PIPE\\LANMAN")
+	logger.Debug("Sending RAP NetShareEnum request to %s", smb1.RAPPipeName)
 
 	// Send TRANSACTION request to \PIPE\LANMAN
-	transResp, err := ipcShare.SendTransaction(`\PIPE\LANMAN`, params, data, c.ctx)
+	transResp, err := ipcShare.SendTransaction(smb1.RAPPipeName, params, data, c.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("NetShareEnum transaction failed: %w", err)
 	}

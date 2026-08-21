@@ -500,7 +500,8 @@ func dosAttributes(attrs uint32) uint16 {
 func (t *Tree) SendTransaction(name string, params, data []byte, ctx context.Context) (*smb1.Trans2Response, error) {
 	// Encode TRANSACTION request
 	allParams, dataBytes, err := smb1.EncodeTransactionRequest(name, params, data,
-		t.Session.conn.transactionMaxDataCount(smb1.TransactionMaxParameterCount))
+		t.Session.conn.transactionMaxDataCount(smb1.TransactionMaxParameterCount),
+		(t.Session.conn.capabilities&smb1.CAP_UNICODE) != 0)
 	if err != nil {
 		return nil, err
 	}
