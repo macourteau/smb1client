@@ -177,6 +177,16 @@ func (c *Session) Logoff() error {
 //
 // The returned Share inherits the Session's context (including any logger).
 // Call Share.WithContext() if you need to use a different context for the share.
+// IsGuest reports whether the server logged this session in as guest rather
+// than as the user the Initiator named.
+//
+// It can only be true when Dialer.AllowGuest was set, since Dial otherwise
+// refuses such a session. Use it to tell a genuine anonymous mount from a
+// silent downgrade of real credentials.
+func (c *Session) IsGuest() bool {
+	return c.s.IsGuest()
+}
+
 // uncServerName returns the address to use as the server component of a UNC
 // path. The transport port must never appear there: a server-name component
 // carrying one is rejected outright with STATUS_DUPLICATE_NAME by servers that

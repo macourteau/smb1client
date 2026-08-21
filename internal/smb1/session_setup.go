@@ -2,6 +2,7 @@ package smb1
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -259,6 +260,16 @@ func DecodeSessionSetupResponse(params, data []byte, useUnicode bool) (*SessionS
 
 	return resp, nil
 }
+
+// ErrGuestLogon reports that the server authenticated the session as guest
+// instead of as the user that was asked for.
+//
+// Many SMB1 servers answer a bad password, or an unknown user, by granting an
+// anonymous session rather than by failing. The setup then succeeds, and the
+// caller holds whatever rights guest has while believing it authenticated as
+// the user it named. The failures that follow look like permissions on
+// individual files rather than like a logon that did not happen.
+var ErrGuestLogon = errors.New("smb1: server granted a guest logon instead of authenticating the requested user")
 
 // IsGuest returns true if the user was logged in as a guest.
 func (r *SessionSetupResponse) IsGuest() bool {

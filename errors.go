@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/macourteau/smb1client/internal/erref"
+	"github.com/macourteau/smb1client/internal/smb1"
 )
 
 // InvalidResponseError indicates the server sent a malformed response.
@@ -148,13 +149,25 @@ func wrapError(err error) error {
 	return err
 }
 
+// ErrGuestLogon reports that the server authenticated the session as guest
+// instead of as the user that was asked for. Dial returns an
+// *AuthenticationError wrapping it unless Dialer.AllowGuest is set.
+var ErrGuestLogon = smb1.ErrGuestLogon
+
 // AuthenticationError represents authentication failures.
 // This provides more context about why authentication failed.
 type AuthenticationError struct {
 	User   string // Username that failed to authenticate
 	Domain string // Domain (if applicable)
 	Reason string // Human-readable reason for failure
+
+	// Err is the underlying cause, when there is one to name, so callers can
+	// classify the failure with errors.Is rather than by reading Reason.
+	Err error
 }
+
+// Unwrap returns the underlying cause, so errors.Is and errors.As reach it.
+func (e *AuthenticationError) Unwrap() error { return e.Err }
 
 func (e *AuthenticationError) Error() string {
 	if e.Domain != "" {
