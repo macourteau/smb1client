@@ -484,6 +484,12 @@ migrating:
   otherwise look like a successful logon. Set `Dialer.AllowGuest` to accept
   such a session and use `Session.IsGuest` to tell the two apart. Both are
   additions to the go-smb2 surface, not changes to it.
+- `Dial` refuses a server that negotiates share-level security
+  (`ErrShareLevelSecurity`) or that requires SMB signing
+  (`ErrSigningRequired`), rather than failing later with an error that names
+  the wrong cause. Signing detection is best effort: a server can require
+  signing without advertising it, and Windows does, so such a session can
+  still fail afterwards.
 
 ## Requirements
 

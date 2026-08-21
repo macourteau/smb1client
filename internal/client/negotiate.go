@@ -64,6 +64,20 @@ func Negotiate(c *Conn, ctx context.Context) error {
 		return fmt.Errorf("smb1: server does not require encrypted passwords (insecure)")
 	}
 
+	// A share-level server expects a password for the share, not credentials
+	// for a user, so the session setup this client performs cannot succeed.
+	if (negResp.SecurityMode & smb1.NEGOTIATE_USER_SECURITY) == 0 {
+		return smb1.ErrShareLevelSecurity
+	}
+
+	// Signing is not implemented here. A server that requires it accepts the
+	// session setup and then rejects the requests that follow, most plausibly
+	// with an access denial that reads as a credentials problem. Say what the
+	// cause actually is while the negotiate response still names it.
+	if (negResp.SecurityMode & smb1.NEGOTIATE_SECURITY_SIGNATURES_REQUIRED) != 0 {
+		return smb1.ErrSigningRequired
+	}
+
 	// Store negotiated parameters in connection
 	c.mu.Lock()
 	c.capabilities = negResp.Capabilities

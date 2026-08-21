@@ -118,7 +118,7 @@ func TestSessionServerTime(t *testing.T) {
 		respHeader.Flags |= smb1.SMB_FLAGS_REPLY
 
 		params := make([]byte, 34)
-		params[2] = smb1.NEGOTIATE_ENCRYPT_PASSWORDS
+		params[2] = smb1.NEGOTIATE_USER_SECURITY | smb1.NEGOTIATE_ENCRYPT_PASSWORDS
 		caps := smb1.CAP_NT_SMBS | smb1.CAP_UNICODE | smb1.CAP_LARGE_FILES | smb1.CAP_STATUS32
 		binary.LittleEndian.PutUint32(params[19:23], caps)
 		binary.LittleEndian.PutUint64(params[23:31], jan1_2020FileTime)

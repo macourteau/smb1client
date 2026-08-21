@@ -2,6 +2,7 @@ package smb1
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -66,6 +67,22 @@ const (
 	NEGOTIATE_SECURITY_SIGNATURES_ENABLED  uint8 = 0x04 // Security signatures enabled
 	NEGOTIATE_SECURITY_SIGNATURES_REQUIRED uint8 = 0x08 // Security signatures required
 )
+
+// ErrShareLevelSecurity reports that the server authenticates per share rather
+// than per user. This client sends a user's credentials, which such a server
+// does not know how to check: it expects a password for the share instead.
+var ErrShareLevelSecurity = errors.New("smb1: server uses share-level security, which this client does not implement")
+
+// ErrSigningRequired reports that the server requires every message to be
+// signed. This client does not sign, so the server would reject its requests
+// after a session had apparently been established — most plausibly as an access
+// denial, which reads as a credentials problem and sends the operator looking
+// in the wrong place.
+//
+// Detecting the advertised bit does not catch every such server: Windows
+// enforces signing without setting it. It does remove the whole class of
+// unactionable failures from the servers that are honest about it.
+var ErrSigningRequired = errors.New("smb1: server requires SMB signing, which this client does not implement")
 
 // DefaultDialects is the default list of dialects to negotiate, in preference order.
 // NT LM 0.12 is the primary SMB1 dialect supported by modern Windows servers.

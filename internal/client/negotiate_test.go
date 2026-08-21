@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"testing"
 	"time"
 
@@ -24,9 +25,10 @@ func TestNegotiateSuccess(t *testing.T) {
 
 	// Prepare successful negotiate response
 	respParams := make([]byte, 34)
-	respParams[0] = 0    // DialectIndex (low)
-	respParams[1] = 0    // DialectIndex (high)
-	respParams[2] = 0x02 // SecurityMode (NEGOTIATE_ENCRYPT_PASSWORDS)
+	respParams[0] = 0 // DialectIndex (low)
+	respParams[1] = 0 // DialectIndex (high)
+	// A real server sets user-level security alongside challenge/response.
+	respParams[2] = 0x03 // SecurityMode (NEGOTIATE_USER_SECURITY|NEGOTIATE_ENCRYPT_PASSWORDS)
 
 	// MaxMpxCount
 	respParams[3] = 50
@@ -115,8 +117,8 @@ func TestNegotiateSuccess(t *testing.T) {
 		if c.maxMpxCount != 50 {
 			t.Errorf("maxMpxCount: got %d, want %d", c.maxMpxCount, 50)
 		}
-		if c.securityMode != 0x02 {
-			t.Errorf("securityMode: got 0x%02X, want 0x02", c.securityMode)
+		if c.securityMode != 0x03 {
+			t.Errorf("securityMode: got 0x%02X, want 0x03", c.securityMode)
 		}
 		if len(c.challenge) != 8 {
 			t.Errorf("challenge length: got %d, want 8", len(c.challenge))
@@ -196,7 +198,7 @@ func TestNegotiateMissingCapabilities(t *testing.T) {
 	respParams := make([]byte, 34)
 	respParams[0] = 0    // DialectIndex
 	respParams[1] = 0    //
-	respParams[2] = 0x02 // SecurityMode
+	respParams[2] = 0x03 // SecurityMode
 
 	// Only set CAP_UNICODE, missing other required caps
 	caps := smb1.CAP_UNICODE
@@ -394,5 +396,80 @@ func TestNegotiateServerError(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("Negotiate timed out")
+	}
+}
+
+// TestNegotiateSecurityMode covers the security-mode bits the negotiate
+// response carries. They were stored on the connection and never read, so a
+// server this client cannot actually talk to was accepted and failed later,
+// with an error naming the wrong cause.
+func TestNegotiateSecurityMode(t *testing.T) {
+	tests := []struct {
+		name         string
+		securityMode byte
+		wantErr      error
+	}{
+		{
+			name:         "user-level security with challenge/response",
+			securityMode: smb1.NEGOTIATE_USER_SECURITY | smb1.NEGOTIATE_ENCRYPT_PASSWORDS,
+		},
+		{
+			name:         "signing offered but not required",
+			securityMode: smb1.NEGOTIATE_USER_SECURITY | smb1.NEGOTIATE_ENCRYPT_PASSWORDS | smb1.NEGOTIATE_SECURITY_SIGNATURES_ENABLED,
+		},
+		{
+			name:         "share-level security",
+			securityMode: smb1.NEGOTIATE_ENCRYPT_PASSWORDS,
+			wantErr:      smb1.ErrShareLevelSecurity,
+		},
+		{
+			name:         "signing required",
+			securityMode: smb1.NEGOTIATE_USER_SECURITY | smb1.NEGOTIATE_ENCRYPT_PASSWORDS | smb1.NEGOTIATE_SECURITY_SIGNATURES_REQUIRED,
+			wantErr:      smb1.ErrSigningRequired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockTCP := newMockConn()
+			c := NewConn(mockTCP)
+			defer c.Close()
+			go c.Receive()
+
+			respParams := make([]byte, 34)
+			respParams[2] = tt.securityMode
+			caps := smb1.CAP_NT_SMBS | smb1.CAP_UNICODE | smb1.CAP_LARGE_FILES | smb1.CAP_STATUS32
+			binary.LittleEndian.PutUint32(respParams[19:23], caps)
+			respParams[33] = 8
+
+			done := make(chan struct{})
+			var err error
+			go func() {
+				err = Negotiate(c, context.Background())
+				close(done)
+			}()
+
+			time.Sleep(10 * time.Millisecond)
+			respHeader := smb1.NewHeader(smb1.SMB_COM_NEGOTIATE)
+			respHeader.Flags |= smb1.SMB_FLAGS_REPLY
+			respHeader.Status = smb1.STATUS_SUCCESS
+			getMockConn(c).addResponse(respHeader, respParams, make([]byte, 8))
+
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("Negotiate timed out")
+			}
+
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Negotiate() error = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Negotiate() error = %v, want it to wrap %v", err, tt.wantErr)
+			}
+		})
 	}
 }
