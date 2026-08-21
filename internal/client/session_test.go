@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"testing/synctest"
@@ -28,7 +29,7 @@ func TestNewSessionSuccess(t *testing.T) {
 		var err error
 
 		go func() {
-			s, err = NewSession(c, initiator, ctx)
+			s, err = NewSession(c, initiator, false, ctx)
 			close(done)
 		}()
 
@@ -92,7 +93,7 @@ func TestNewSessionNegotiateFails(t *testing.T) {
 	initiator.negotiateErr = errors.New("negotiate failed")
 
 	ctx := context.Background()
-	_, err := NewSession(c, initiator, ctx)
+	_, err := NewSession(c, initiator, false, ctx)
 
 	if err == nil {
 		t.Fatal("NewSession should have failed")
@@ -117,7 +118,7 @@ func TestNewSessionAuthenticateFails(t *testing.T) {
 		var err error
 
 		go func() {
-			_, err = NewSession(c, initiator, ctx)
+			_, err = NewSession(c, initiator, false, ctx)
 			close(done)
 		}()
 
@@ -734,4 +735,84 @@ func TestSessionSendAndSendRecv(t *testing.T) {
 
 		t.Logf("Session.send and Session.sendRecv both succeeded")
 	})
+}
+
+// TestNewSessionGuestLogon covers the Action bit a server sets when it logs the
+// session in as guest rather than as the user that was asked for. The setup
+// reports success either way, so the bit is the only thing that distinguishes
+// them.
+func TestNewSessionGuestLogon(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     uint16
+		allowGuest bool
+		wantErr    bool
+		wantGuest  bool
+	}{
+		{name: "a real logon is accepted", action: 0, allowGuest: false},
+		{name: "a guest logon is refused by default", action: smb1.SESSION_SETUP_GUEST, allowGuest: false, wantErr: true},
+		{name: "a guest logon is accepted when asked for", action: smb1.SESSION_SETUP_GUEST, allowGuest: true, wantGuest: true},
+		{name: "a real logon is unaffected by AllowGuest", action: 0, allowGuest: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := setupTestConn()
+				defer c.Close()
+				go c.Receive()
+
+				done := make(chan struct{})
+				var s *Session
+				var err error
+				go func() {
+					s, err = NewSession(c, newMockInitiator(), tt.allowGuest, context.Background())
+					close(done)
+				}()
+
+				// Round one: the challenge.
+				time.Sleep(10 * time.Millisecond)
+				h1 := smb1.NewHeader(smb1.SMB_COM_SESSION_SETUP_ANDX)
+				h1.Flags |= smb1.SMB_FLAGS_REPLY
+				h1.Status = smb1.STATUS_MORE_PROCESSING_REQUIRED
+				h1.MID = 0
+				h1.UID = 100
+				p1 := make([]byte, 8)
+				p1[0] = smb1.SMB_COM_NO_ANDX_COMMAND
+				p1[6] = 8
+				getMockConn(c).addResponse(h1, p1, []byte("challenge"))
+
+				// Round two: success, carrying the Action flags under test.
+				time.Sleep(10 * time.Millisecond)
+				h2 := smb1.NewHeader(smb1.SMB_COM_SESSION_SETUP_ANDX)
+				h2.Flags |= smb1.SMB_FLAGS_REPLY
+				h2.Status = smb1.STATUS_SUCCESS
+				h2.MID = 1
+				h2.UID = 100
+				p2 := make([]byte, 8)
+				p2[0] = smb1.SMB_COM_NO_ANDX_COMMAND
+				binary.LittleEndian.PutUint16(p2[4:6], tt.action)
+				getMockConn(c).addResponse(h2, p2, nil)
+
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("NewSession timed out")
+				}
+
+				if tt.wantErr {
+					if !errors.Is(err, smb1.ErrGuestLogon) {
+						t.Fatalf("NewSession() error = %v, want it to wrap ErrGuestLogon", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewSession() error = %v", err)
+				}
+				if s.IsGuest() != tt.wantGuest {
+					t.Errorf("IsGuest() = %v, want %v", s.IsGuest(), tt.wantGuest)
+				}
+			})
+		})
+	}
 }

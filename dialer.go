@@ -2,10 +2,12 @@ package smb1
 
 import (
 	"context"
+	"errors"
 	"net"
 
 	"github.com/macourteau/smb1client/internal/client"
 	"github.com/macourteau/smb1client/internal/ntlm"
+	"github.com/macourteau/smb1client/internal/smb1"
 )
 
 // Negotiator contains options for protocol negotiation, mirroring go-smb2's
@@ -36,6 +38,17 @@ type Dialer struct {
 	// Initiator is required for authentication.
 	// Use NTLMInitiator for NTLM v2 authentication.
 	Initiator Initiator
+
+	// AllowGuest permits the server to log the session in as guest instead of
+	// as the user named by the Initiator.
+	//
+	// Many SMB1 servers answer a bad password, or an unknown user, by granting
+	// an anonymous session rather than by refusing. Left false, Dial fails with
+	// ErrGuestLogon rather than handing back a session whose rights are not the
+	// ones that were asked for. Set it only where anonymous access is the
+	// intent, such as a deliberately public share, and use Session.IsGuest to
+	// find out which kind of session was granted.
+	AllowGuest bool
 }
 
 // Dial performs protocol negotiation and authentication on the provided TCP connection.
@@ -142,9 +155,17 @@ func (d *Dialer) DialContext(ctx context.Context, tcpConn net.Conn) (*Session, e
 	// Perform session setup (NTLM authentication).
 	// If this fails, conn.Close() will signal the Receive goroutine to exit.
 	logger.Debug("Performing session setup (NTLM authentication)")
-	sess, err := client.NewSession(conn, initiator, ctx)
+	sess, err := client.NewSession(conn, initiator, d.AllowGuest, ctx)
 	if err != nil {
 		conn.Close()
+		if errors.Is(err, smb1.ErrGuestLogon) {
+			return nil, &AuthenticationError{
+				User:   initiatorUser(d.Initiator),
+				Domain: initiatorDomain(d.Initiator),
+				Reason: "the server granted a guest logon instead; set Dialer.AllowGuest to accept it",
+				Err:    err,
+			}
+		}
 		return nil, wrapError(err)
 	}
 
@@ -182,4 +203,20 @@ func (w *initiatorWrapper) Session() *ntlm.Session {
 		return ni.ntlm.Session()
 	}
 	return nil
+}
+
+// initiatorUser and initiatorDomain name the credentials an error is about.
+// Only NTLMInitiator carries them; anything else stays unnamed.
+func initiatorUser(i Initiator) string {
+	if n, ok := i.(*NTLMInitiator); ok {
+		return n.User
+	}
+	return ""
+}
+
+func initiatorDomain(i Initiator) string {
+	if n, ok := i.(*NTLMInitiator); ok {
+		return n.Domain
+	}
+	return ""
 }

@@ -28,6 +28,7 @@ type Initiator interface {
 type Session struct {
 	conn      *Conn            // underlying connection
 	uid       uint16           // user ID from session setup
+	isGuest   bool             // server logged us in as guest, not as the requested user
 	initiator Initiator        // NTLM authenticator
 	mu        sync.Mutex       // protects trees map
 	trees     map[uint16]*Tree // active tree connections by TID
@@ -50,7 +51,7 @@ type Tree struct {
 // The session setup process involves two round trips:
 // 1. Send NTLM negotiate message (receive challenge)
 // 2. Send NTLM authenticate message (receive session UID)
-func NewSession(c *Conn, initiator Initiator, ctx context.Context) (*Session, error) {
+func NewSession(c *Conn, initiator Initiator, allowGuest bool, ctx context.Context) (*Session, error) {
 	logger := logging.FromContext(ctx)
 	logger.Debug("NewSession: starting session setup")
 
@@ -164,11 +165,34 @@ func NewSession(c *Conn, initiator Initiator, ctx context.Context) (*Session, er
 		return nil, fmt.Errorf("smb1: session setup (authenticate) returned error: %w", resp2.err)
 	}
 
+	// The response to the authenticate round carries the flag saying whether
+	// the server logged this session in as guest rather than as the user that
+	// was asked for. A server that does that reports success either way, so the
+	// flag is the only way to tell the two apart.
+	authResp, err := smb1.DecodeSessionSetupResponse(resp2.params, resp2.data, req2.UseUnicode)
+	if err != nil {
+		return nil, fmt.Errorf("smb1: failed to decode session setup response: %w", err)
+	}
+	s.isGuest = authResp.IsGuest()
+	if s.isGuest {
+		if !allowGuest {
+			logger.Warn("NewSession: server granted a guest logon; refusing it")
+			return nil, smb1.ErrGuestLogon
+		}
+		logger.Warn("NewSession: server granted a guest logon; continuing because guest access was requested")
+	}
+
 	// Store UID from response
 	s.uid = resp2.header.UID
-	logger.Debug("NewSession: session setup complete (UID=%d)", s.uid)
+	logger.Debug("NewSession: session setup complete (UID=%d, guest=%v)", s.uid, s.isGuest)
 
 	return s, nil
+}
+
+// IsGuest reports whether the server logged this session in as guest rather
+// than as the user that was asked for.
+func (s *Session) IsGuest() bool {
+	return s.isGuest
 }
 
 // send sends an SMB request with the session's UID set.

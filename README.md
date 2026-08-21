@@ -477,6 +477,13 @@ migrating:
   is also a remote file; the data always flows through the client.
 - `Mount` accepts either a bare share name or a full UNC path
   (`\\server\share`), same as go-smb2.
+- `Dial` refuses a session the server logged in as guest rather than as the
+  user the `Initiator` named, returning an `*AuthenticationError` wrapping
+  `ErrGuestLogon`. Many SMB1 servers answer a bad password, or an unknown
+  user, by granting an anonymous session instead of failing, which would
+  otherwise look like a successful logon. Set `Dialer.AllowGuest` to accept
+  such a session and use `Session.IsGuest` to tell the two apart. Both are
+  additions to the go-smb2 surface, not changes to it.
 
 ## Requirements
 
