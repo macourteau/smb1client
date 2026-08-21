@@ -18,6 +18,10 @@ type mockConn struct {
 	readBuf  *bytes.Buffer
 	writeBuf *bytes.Buffer
 	closed   bool
+
+	// readDeadlines records every SetReadDeadline call, in order, so a test can
+	// see which reads a deadline covered. A zero time means "no deadline".
+	readDeadlines []time.Time
 }
 
 func newMockConn() *mockConn {
@@ -54,8 +58,11 @@ func (m *mockConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("192.168.1.1"), Port: 445}
 }
 
-func (m *mockConn) SetDeadline(t time.Time) error      { return nil }
-func (m *mockConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *mockConn) SetDeadline(t time.Time) error { return nil }
+func (m *mockConn) SetReadDeadline(t time.Time) error {
+	m.readDeadlines = append(m.readDeadlines, t)
+	return nil
+}
 func (m *mockConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // Helper to write a NetBIOS header to the mock connection
@@ -718,4 +725,63 @@ func TestContextBasedLogging(t *testing.T) {
 			t.Errorf("No write logs found. Logs: %v", logger.logs)
 		}
 	})
+}
+
+// TestReadPacketDeadlineCoversOnlyTheBody pins which read the timeout guards.
+//
+// The receive loop spends all of an idle connection's life blocked on the
+// header read. A deadline armed before it therefore fails a connection for
+// being idle: a session untouched for longer than ReadTimeout was dead, while
+// the connection pool was holding sessions idle for minutes. The timeout
+// exists to bound an allocation a header has already announced, so it belongs
+// on the body read alone.
+func TestReadPacketDeadlineCoversOnlyTheBody(t *testing.T) {
+	tests := []struct {
+		name             string
+		packet           []byte
+		wantBodyDeadline bool
+	}{
+		{
+			name:             "message with a payload",
+			packet:           append([]byte{0x00, 0x00, 0x00, 0x04}, []byte("data")...),
+			wantBodyDeadline: true,
+		},
+		{
+			name:             "zero-length message reads no body",
+			packet:           []byte{0x00, 0x00, 0x00, 0x00},
+			wantBodyDeadline: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := newMockConn()
+			conn.readBuf.Write(tt.packet)
+			session := NewSession(conn)
+
+			if _, err := session.ReadPacket(); err != nil {
+				t.Fatalf("ReadPacket() error = %v", err)
+			}
+
+			if len(conn.readDeadlines) == 0 {
+				t.Fatal("ReadPacket() set no read deadline at all")
+			}
+
+			// Whatever else happens, the header must be read with no deadline.
+			if first := conn.readDeadlines[0]; !first.IsZero() {
+				t.Errorf("the header read was covered by a deadline (%v); an idle connection would be failed for being idle", first)
+			}
+
+			var armed bool
+			for _, d := range conn.readDeadlines[1:] {
+				if !d.IsZero() {
+					armed = true
+				}
+			}
+			if armed != tt.wantBodyDeadline {
+				t.Errorf("deadline armed for the body read = %v, want %v (deadlines: %v)",
+					armed, tt.wantBodyDeadline, conn.readDeadlines)
+			}
+		})
+	}
 }
