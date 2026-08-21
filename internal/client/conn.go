@@ -33,6 +33,10 @@ const (
 	// the waiter is still reassembling, so one slot is not enough.
 	responseQueueDepth = 64
 
+	// reservedMID is the multiplex ID [MS-CIFS] reserves for server-initiated
+	// oplock break notifications. It must never be allocated to a request.
+	reservedMID = 0xFFFF
+
 	// maxTrans2Fragments bounds the number of messages accepted for one TRANS2
 	// reply. The largest reply this client asks for is 64 KiB, which a server
 	// sending the SMB1 minimum of 4356 bytes per message splits into 16; the
@@ -151,8 +155,15 @@ func (c *Conn) allocateMID() (uint16, error) {
 		mid := c.nextMID
 		c.nextMID++
 
-		if _, exists := c.pending[mid]; !exists {
-			return mid, nil
+		// [MS-CIFS] reserves 0xFFFF for the oplock break notifications a server
+		// sends unbidden. Handing it out would make such a notification
+		// indistinguishable from the reply to whichever request held it. The
+		// skip stays inside the loop body rather than short-circuiting it, so
+		// the wrap-around check below still runs on every pass.
+		if mid != reservedMID {
+			if _, exists := c.pending[mid]; !exists {
+				return mid, nil
+			}
 		}
 
 		// Wrapped around without finding free MID

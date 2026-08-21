@@ -115,11 +115,13 @@ func TestAllocateMIDWrap(t *testing.T) {
 	if mid1 != 65534 {
 		t.Errorf("mid1: got %d, want 65534", mid1)
 	}
-	if mid2 != 65535 {
-		t.Errorf("mid2: got %d, want 65535", mid2)
+	// 65535 is reserved by [MS-CIFS] for server-initiated oplock breaks and is
+	// skipped, so the sequence steps straight from 65534 to the wrap.
+	if mid2 != 0 {
+		t.Errorf("mid2: got %d, want 0 (65535 is reserved)", mid2)
 	}
-	if mid3 != 0 {
-		t.Errorf("mid3: got %d, want 0", mid3)
+	if mid3 != 1 {
+		t.Errorf("mid3: got %d, want 1", mid3)
 	}
 }
 
@@ -494,5 +496,38 @@ func TestBeginRequestCancelledContextLeavesConnectionUsable(t *testing.T) {
 	// The connection must still accept work on a live context.
 	if _, _, _, err := c.beginRequest(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background()); err != nil {
 		t.Errorf("beginRequest() on a live context after a cancelled one failed: %v", err)
+	}
+}
+
+// TestAllocateMIDExhaustionTerminates guards the wrap-around detection. Skipping
+// the reserved ID must not skip the check that ends the scan, or an exhausted
+// connection would spin forever instead of reporting the exhaustion.
+func TestAllocateMIDExhaustionTerminates(t *testing.T) {
+	mockTCP := newMockConn()
+	c := NewConn(mockTCP)
+	defer c.Close()
+
+	// Occupy every allocatable ID.
+	for mid := 0; mid <= 0xFFFF; mid++ {
+		if uint16(mid) == reservedMID {
+			continue
+		}
+		c.pending[uint16(mid)] = &pendingRequest{respCh: make(chan *response, 1)}
+	}
+	c.nextMID = 0
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.allocateMID()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("allocateMID() succeeded with every ID taken")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("allocateMID() did not terminate with every ID taken")
 	}
 }
