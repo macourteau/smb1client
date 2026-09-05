@@ -58,11 +58,23 @@ jobs:
             echo "floor already sufficient"
             exit 0
           fi
+          # `gh pr view auto/go-floor` resolves the branch's most recent PR
+          # *including merged ones*, so a floor PR left over from an earlier
+          # raise reads as MERGED the instant this loop starts -- before the
+          # dispatch below has opened its PR -- and the dep PR is rebased
+          # against the floor it was supposed to wait for. Anchor on the newest
+          # PR number that exists before the dispatch and require a strictly
+          # newer one, so only this run's PR can end the wait.
+          baseline=$(gh pr list --head auto/go-floor --state all --json number \
+                     --jq '[.[].number] | max // 0' 2>/dev/null || echo 0)
           gh workflow run update-go-floor.yml -f floor="$needed"
           # Wait for the floor PR to land on main, then rebase this dep PR so
           # its checks re-run against the raised floor.
+          state=NONE
           for i in $(seq 1 60); do
-            state=$(gh pr view auto/go-floor --json state --jq .state 2>/dev/null || echo NONE)
+            state=$(gh pr list --head auto/go-floor --state all --json number,state \
+                    --jq "[.[] | select(.number > $baseline)] | max_by(.number) | .state // \"NONE\"" \
+                    2>/dev/null || echo NONE)
             [ "$state" = "MERGED" ] && break
             sleep 15
           done
