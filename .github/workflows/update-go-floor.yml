@@ -82,7 +82,16 @@ jobs:
           git diff -- go.mod
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b auto/go-floor
+          # --force-with-lease leases against the remote-tracking ref, which git
+          # resolves through the fetch refspec. The checkout is single-branch, so
+          # the refspec covers only the default branch and the lease reads as
+          # "expect no such branch on the remote" — rejecting the push as "stale
+          # info" for as long as the branch outlives a merged PR. Widening the
+          # refspec and fetching the tip restores a real lease; the fetch fails
+          # harmlessly when the branch does not exist on the remote.
+          git remote set-branches --add origin auto/go-floor
+          git fetch --depth 1 origin auto/go-floor || true
+          git switch -C auto/go-floor
           git commit -am "feat: raise the Go version floor to ${SHORT}"
           git push --force-with-lease origin auto/go-floor
           gh pr create --fill --head auto/go-floor 2>/dev/null || true
