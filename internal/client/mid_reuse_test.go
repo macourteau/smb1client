@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -282,4 +283,95 @@ func TestMIDExhaustionTearsTheConnectionDown(t *testing.T) {
 			t.Error("socket left open after running out of MIDs")
 		}
 	})
+}
+
+// TestTransactionAbandonedWithFragmentBufferedStaysReserved pins the one case
+// where a reply already sitting in the channel does not settle a request: a
+// transaction's first fragment may have arrived unread when its reader gives
+// up, with more of the reply still on the way.
+func TestTransactionAbandonedWithFragmentBufferedStaysReserved(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		transaction  bool
+		wantReserved bool
+	}{
+		{name: "transaction", transaction: true, wantReserved: true},
+		{name: "single-message request", transaction: false, wantReserved: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				mock := newEnhancedMockConnWithLogging(t)
+				conn := NewConn(mock)
+				defer conn.Close()
+				go conn.Receive()
+
+				_, mid, finish, err := conn.beginRequest(smb1.NewHeader(smb1.SMB_COM_TRANSACTION2), nil, nil, context.Background(), tc.transaction)
+				if err != nil {
+					t.Fatalf("beginRequest() error = %v", err)
+				}
+				p, d := trans2Fragment(0, 300, nil, make([]byte, 100), 0, 0)
+				h := smb1.NewHeader(smb1.SMB_COM_TRANSACTION2)
+				h.MID = mid
+				h.Flags |= smb1.SMB_FLAGS_REPLY
+				mock.inner.addResponse(h, p, d)
+				synctest.Wait() // the fragment is now buffered, unread
+
+				finish(true)
+
+				_, reserved := pendingByState(conn)
+				if got := len(reserved) == 1 && reserved[0] == mid; got != tc.wantReserved {
+					t.Errorf("MID %d reserved after abandonment = %v, want %v (reserved: %v)", mid, got, tc.wantReserved, reserved)
+				}
+			})
+		})
+	}
+}
+
+// TestAbandonRacingItsReplyNeverStrandsTheMID races a sender giving up against
+// its reply arriving. Whichever wins, the MID must end up free once the reply
+// has been processed: handed over before the abandonment, the abandonment sees
+// it in the channel; handed over after, the receive loop discards it as late.
+// Only a hand-off made under the connection lock rules out the third ordering,
+// where the reply lands in the channel of a request already marked abandoned
+// and the MID is held for a reply that has in fact come and gone.
+func TestAbandonRacingItsReplyNeverStrandsTheMID(t *testing.T) {
+	mock := newEnhancedMockConn()
+	conn := NewConn(mock)
+	defer conn.Close()
+	go conn.Receive()
+
+	reply := func(mid uint16) {
+		h := smb1.NewHeader(smb1.SMB_COM_ECHO)
+		h.MID = mid
+		h.Flags |= smb1.SMB_FLAGS_REPLY
+		mock.inner.addResponse(h, nil, nil)
+	}
+
+	for i := 0; i < 5000; i++ {
+		_, mid, finish, err := conn.beginRequest(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background(), false)
+		if err != nil {
+			t.Fatalf("beginRequest() error = %v", err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; finish(true) }()
+		go func() { defer wg.Done(); <-start; reply(mid) }()
+		close(start)
+		wg.Wait()
+
+		// The receive loop handles messages in order, so once a marker
+		// request has its reply, the raced reply has been processed too.
+		markerCh, marker, finishMarker, err := conn.beginRequest(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background(), false)
+		if err != nil {
+			t.Fatalf("beginRequest() error = %v", err)
+		}
+		reply(marker)
+		<-markerCh
+		finishMarker(false)
+
+		if live, reserved := pendingByState(conn); len(live)+len(reserved) != 0 {
+			t.Fatalf("iteration %d: MID %d stranded after its reply was processed (live %v, reserved %v)", i, mid, live, reserved)
+		}
+	}
 }
