@@ -858,6 +858,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 	// what make the returned count truthful. See writeDrainTimeout.
 	draining := false
 	var abortCh <-chan time.Time
+	var drainDeadline time.Time
 	var deferredErr error
 
 	stopFeeding := func(cause error) {
@@ -865,6 +866,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 			return
 		}
 		draining = true
+		drainDeadline = time.Now().Add(writeDrainTimeout)
 		abortCh = time.After(writeDrainTimeout)
 		// A send that failed only because the caller gave up is reported as the
 		// cancellation it was, so callers can classify it the usual way rather
@@ -906,6 +908,17 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		}
 	}
 
+	// settleRest collects the replies to the chunks after i, within what is
+	// left of a drain already under way, so one Write never waits longer than
+	// writeDrainTimeout in all.
+	settleRest := func(i int, cause error) {
+		timeout := writeDrainTimeout
+		if draining {
+			timeout = max(time.Until(drainDeadline), 0)
+		}
+		collectReplies(ctx, f.session.conn, timeout, chunks[i+1:nextToSend], cause)
+	}
+
 	for i := 0; i < numChunks; i++ {
 		// Only process chunks that were actually sent
 		// Chunks 0..sent-1 were sent in initial batch
@@ -930,14 +943,14 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 
 		// Handle response error
 		if resp.err != nil {
-			collectReplies(ctx, f.session.conn, writeDrainTimeout, chunks[i+1:nextToSend], resp.err)
+			settleRest(i, resp.err)
 			return totalWritten, fmt.Errorf("smb1: write failed: %w", resp.err)
 		}
 
 		// Decode response
 		writeResp, decodeErr := smb1.DecodeWriteResponse(resp.params, resp.data)
 		if decodeErr != nil {
-			collectReplies(ctx, f.session.conn, writeDrainTimeout, chunks[i+1:nextToSend], decodeErr)
+			settleRest(i, decodeErr)
 			return totalWritten, fmt.Errorf("smb1: failed to decode write response: %w", decodeErr)
 		}
 
@@ -947,7 +960,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 
 		// If we wrote less than requested, it's an error
 		if bytesWritten < len(chunk.data) {
-			collectReplies(ctx, f.session.conn, writeDrainTimeout, chunks[i+1:nextToSend], io.ErrShortWrite)
+			settleRest(i, io.ErrShortWrite)
 			return totalWritten, io.ErrShortWrite
 		}
 

@@ -489,3 +489,39 @@ func TestFileSingleRequestCancelSettlesBeforeReturning(t *testing.T) {
 		})
 	}
 }
+
+// TestFileWritePipelinedDrainIsBoundedOnce checks that one Write never waits
+// longer than writeDrainTimeout in total for chunks already on the wire. A
+// cancellation starts the drain; an error reply arriving late in it ends the
+// write early, and the chunks still owed must be waited for only for what is
+// left of the same bound, not for a fresh one.
+func TestFileWritePipelinedDrainIsBoundedOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const cancelAt = 10 * time.Millisecond
+		s := newSlowServer(t, func(i int, req SMBRequest) chunkReply {
+			if i == 0 {
+				return chunkReply{delay: writeDrainTimeout - time.Second, status: smb1.STATUS_ACCESS_DENIED}
+			}
+			return chunkReply{never: true}
+		})
+		f, conn := newDrainTestFile(s)
+		defer conn.Close()
+		defer s.replies.Wait()
+		go conn.Receive()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(cancelAt, cancel)
+
+		start := time.Now()
+		_, err := f.Write(make([]byte, 512<<10), ctx)
+		elapsed := time.Since(start)
+
+		if err == nil {
+			t.Error("Write() error = nil, want the failure")
+		}
+		if limit := cancelAt + writeDrainTimeout; elapsed > limit {
+			t.Errorf("Write() drained for %v after the cancellation, want at most %v in all", elapsed-cancelAt, writeDrainTimeout)
+		}
+	})
+}
