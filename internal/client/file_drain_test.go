@@ -12,42 +12,47 @@ import (
 	"github.com/macourteau/smb1client/internal/smb1"
 )
 
-// slowReadServer answers READ_ANDX requests after a delay, the way smbd does
-// when it serves reads asynchronously, and records whether a CLOSE ever
-// arrives while one of them is still unanswered. That overlap is what Samba
-// 4.13 and later crash on, so the client must never produce it.
-type slowReadServer struct {
+// slowServer answers READ_ANDX and WRITE_ANDX requests after a delay, the way
+// smbd does when it serves them asynchronously, and records whether a CLOSE
+// ever arrives while one of them is still unanswered. That overlap is what
+// Samba 4.13 and later crash on, so the client must never produce it.
+type slowServer struct {
 	mock *EnhancedMockConn
 	// replies tracks the goroutines holding back answers, so a test can
-	// let them finish before its bubble ends whether or not Read waited.
+	// let them finish before its bubble ends whether or not the client waited.
 	replies sync.WaitGroup
 
 	mu          sync.Mutex
-	outstanding map[uint16]bool // READ_ANDX MIDs received and not yet answered
-	closeSawMax int             // most reads outstanding when a CLOSE arrived
+	outstanding map[uint16]bool // READ_ANDX/WRITE_ANDX MIDs received and not yet answered
+	closeSawMax int             // most requests outstanding when a CLOSE arrived
 	closes      int
 }
 
-// readReply is how the server answers one chunk: after delay, with either an
-// error status or data. never leaves the request unanswered.
-type readReply struct {
-	delay  time.Duration
-	status uint32
-	data   []byte
-	never  bool
+// chunkReply is how the server answers one chunk: after delay, with either an
+// error status or success. A read succeeds with data; a write succeeds having
+// written its whole payload, or only written bytes when that is set.
+// malformed answers success with no parameter words, which no reply decodes.
+// never leaves the request unanswered.
+type chunkReply struct {
+	delay     time.Duration
+	status    uint32
+	data      []byte
+	written   *uint32
+	malformed bool
+	never     bool
 }
 
-func newSlowReadServer(t *testing.T, reply func(chunk int, req SMBRequest) readReply) *slowReadServer {
-	s := &slowReadServer{
+func newSlowServer(t *testing.T, reply func(chunk int, req SMBRequest) chunkReply) *slowServer {
+	s := &slowServer{
 		mock:        newEnhancedMockConnWithLogging(t),
 		outstanding: make(map[uint16]bool),
 	}
-	var reads int
+	var chunks int
 	s.mock.SetAutoResponder(func(req SMBRequest) (*smb1.Header, []byte, []byte) {
 		switch req.Command {
-		case smb1.SMB_COM_READ_ANDX:
-			r := reply(reads, req)
-			reads++
+		case smb1.SMB_COM_READ_ANDX, smb1.SMB_COM_WRITE_ANDX:
+			r := reply(chunks, req)
+			chunks++
 			s.mu.Lock()
 			s.outstanding[req.MID] = true
 			s.mu.Unlock()
@@ -60,10 +65,15 @@ func newSlowReadServer(t *testing.T, reply func(chunk int, req SMBRequest) readR
 				time.Sleep(r.delay)
 				var h *smb1.Header
 				var params, data []byte
-				if r.status != smb1.STATUS_SUCCESS {
+				switch {
+				case r.status != smb1.STATUS_SUCCESS, r.malformed:
 					h, params, data = CreateErrorResponse(req.MID, req.Command, r.status)
-				} else {
+				case req.Command == smb1.SMB_COM_READ_ANDX:
 					h, params, data = CreateReadResponse(req.MID, r.data)
+				case r.written != nil:
+					h, params, data = CreateWriteResponse(req.MID, *r.written)
+				default:
+					h, params, data = CreateWriteResponse(req.MID, uint32(len(req.WriteData)))
 				}
 				s.mu.Lock()
 				delete(s.outstanding, req.MID)
@@ -83,15 +93,15 @@ func newSlowReadServer(t *testing.T, reply func(chunk int, req SMBRequest) readR
 	return s
 }
 
-func (s *slowReadServer) outstandingReads() int {
+func (s *slowServer) outstandingRequests() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.outstanding)
 }
 
-// newDrainTestFile wires a File to s with the pipeline depth a Samba server
-// typically grants a 512 KiB read: one batch of eight requests.
-func newDrainTestFile(s *slowReadServer) (*File, *Conn) {
+// newDrainTestFile wires a File to s with a pipeline depth of eight, so a
+// 512 KiB transfer is one full batch plus a straggler.
+func newDrainTestFile(s *slowServer) (*File, *Conn) {
 	conn := NewConn(s.mock)
 	conn.maxBufferSize = 65535
 	conn.maxMpxCount = 8
@@ -117,65 +127,65 @@ func TestFileReadPipelinedCollectsEveryReplyBeforeReturning(t *testing.T) {
 
 	for _, tc := range []struct {
 		name        string
-		reply       func(i int, req SMBRequest) readReply
+		reply       func(i int, req SMBRequest) chunkReply
 		cancelAfter time.Duration
 		wantN       int
 		wantErr     error
 	}{
 		{
 			name: "short first chunk",
-			reply: func(i int, req SMBRequest) readReply {
+			reply: func(i int, req SMBRequest) chunkReply {
 				if i == 0 {
-					return readReply{delay: time.Millisecond, data: make([]byte, 1000)}
+					return chunkReply{delay: time.Millisecond, data: make([]byte, 1000)}
 				}
-				return readReply{delay: late}
+				return chunkReply{delay: late}
 			},
 			wantN: 1000,
 		},
 		{
 			name: "short chunk after a full one",
-			reply: func(i int, req SMBRequest) readReply {
+			reply: func(i int, req SMBRequest) chunkReply {
 				switch i {
 				case 0:
-					return readReply{delay: time.Millisecond, data: full(req)}
+					return chunkReply{delay: time.Millisecond, data: full(req)}
 				case 1:
-					return readReply{delay: 2 * time.Millisecond, data: make([]byte, 7)}
+					return chunkReply{delay: 2 * time.Millisecond, data: make([]byte, 7)}
 				}
-				return readReply{delay: late}
+				return chunkReply{delay: late}
 			},
 			wantN: chunk + 7,
 		},
 		{
 			name: "empty first chunk at end of file",
-			reply: func(i int, req SMBRequest) readReply {
-				return readReply{delay: time.Millisecond + time.Duration(i)*late}
+			reply: func(i int, req SMBRequest) chunkReply {
+				return chunkReply{delay: time.Millisecond + time.Duration(i)*late}
 			},
 			wantErr: io.EOF,
 		},
 		{
 			name: "end-of-file status on the first chunk",
-			reply: func(i int, req SMBRequest) readReply {
+			reply: func(i int, req SMBRequest) chunkReply {
 				if i == 0 {
-					return readReply{delay: time.Millisecond, status: smb1.STATUS_END_OF_FILE}
+					return chunkReply{delay: time.Millisecond, status: smb1.STATUS_END_OF_FILE}
 				}
-				return readReply{delay: late, status: smb1.STATUS_END_OF_FILE}
+				return chunkReply{delay: late, status: smb1.STATUS_END_OF_FILE}
 			},
 			wantErr: io.EOF,
 		},
 		{
 			name: "error on the first chunk",
-			reply: func(i int, req SMBRequest) readReply {
+			reply: func(i int, req SMBRequest) chunkReply {
 				if i == 0 {
-					return readReply{delay: time.Millisecond, status: smb1.STATUS_ACCESS_DENIED}
+					return chunkReply{delay: time.Millisecond, status: smb1.STATUS_ACCESS_DENIED}
 				}
-				return readReply{delay: late, data: full(req)}
+				return chunkReply{delay: late, data: full(req)}
 			},
 			wantErr: errAny,
 		},
 		{
 			name: "context cancelled mid-batch",
-			reply: func(i int, req SMBRequest) readReply {
-				return readReply{delay: late, data: full(req)}
+			reply: func(i int, req SMBRequest) chunkReply {
+				return chunkReply{delay: late, data: full(req)}
 			},
 			cancelAfter: 10 * time.Millisecond,
 			wantErr:     context.Canceled,
@@ -183,7 +193,7 @@ func TestFileReadPipelinedCollectsEveryReplyBeforeReturning(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				s := newSlowReadServer(t, tc.reply)
+				s := newSlowServer(t, tc.reply)
 				f, conn := newDrainTestFile(s)
 				defer conn.Close()
 				defer s.replies.Wait()
@@ -213,7 +223,7 @@ func TestFileReadPipelinedCollectsEveryReplyBeforeReturning(t *testing.T) {
 					t.Errorf("Read() error = %v, want %v", err, tc.wantErr)
 				}
 
-				if got := s.outstandingReads(); got != 0 {
+				if got := s.outstandingRequests(); got != 0 {
 					t.Errorf("Read() returned with %d reads still unanswered on the server", got)
 				}
 
@@ -243,14 +253,14 @@ var errAny = errors.New("any read failure")
 // result is the one the stop produced, and the abandoned MID is released.
 func TestFileReadPipelinedDrainGivesUp(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s := newSlowReadServer(t, func(i int, req SMBRequest) readReply {
+		s := newSlowServer(t, func(i int, req SMBRequest) chunkReply {
 			switch i {
 			case 0:
-				return readReply{delay: time.Millisecond, data: make([]byte, 1000)}
+				return chunkReply{delay: time.Millisecond, data: make([]byte, 1000)}
 			case 1:
-				return readReply{never: true}
+				return chunkReply{never: true}
 			}
-			return readReply{delay: 50 * time.Millisecond, data: make([]byte, req.ReadLength)}
+			return chunkReply{delay: 50 * time.Millisecond, data: make([]byte, req.ReadLength)}
 		})
 		f, conn := newDrainTestFile(s)
 		defer conn.Close()
@@ -267,7 +277,7 @@ func TestFileReadPipelinedDrainGivesUp(t *testing.T) {
 		if elapsed < readDrainTimeout || elapsed > readDrainTimeout+time.Second {
 			t.Errorf("Read() took %v, want it to give up on the silent reply after %v", elapsed, readDrainTimeout)
 		}
-		if got := s.outstandingReads(); got != 1 {
+		if got := s.outstandingRequests(); got != 1 {
 			t.Errorf("%d reads unanswered on the server, want only the silent one", got)
 		}
 
@@ -278,4 +288,121 @@ func TestFileReadPipelinedDrainGivesUp(t *testing.T) {
 			t.Errorf("%d MIDs still registered after the drain gave up", pending)
 		}
 	})
+}
+
+// TestFileWritePipelinedCollectsEveryReplyBeforeReturning is the write-side
+// counterpart: however a pipelined Write stops early, the chunks it already
+// put on the wire are answered before it returns, so a Close straight after
+// never overlaps a write still pending on the server. The count reported stays
+// the contiguous prefix the server confirmed.
+func TestFileWritePipelinedCollectsEveryReplyBeforeReturning(t *testing.T) {
+	late := 50 * time.Millisecond
+	fast := time.Millisecond
+	half := uint32(1000)
+
+	for _, tc := range []struct {
+		name        string
+		reply       func(i int, req SMBRequest) chunkReply
+		cancelAfter time.Duration
+		wantN       func(chunk int) int
+		wantErr     error
+	}{
+		{
+			name: "error on the first chunk",
+			reply: func(i int, req SMBRequest) chunkReply {
+				if i == 0 {
+					return chunkReply{delay: fast, status: smb1.STATUS_ACCESS_DENIED}
+				}
+				return chunkReply{delay: late}
+			},
+			wantN:   func(int) int { return 0 },
+			wantErr: errAny,
+		},
+		{
+			name: "error after a confirmed chunk",
+			reply: func(i int, req SMBRequest) chunkReply {
+				switch i {
+				case 0:
+					return chunkReply{delay: fast}
+				case 1:
+					return chunkReply{delay: 2 * fast, status: smb1.STATUS_ACCESS_DENIED}
+				}
+				return chunkReply{delay: late}
+			},
+			wantN:   func(chunk int) int { return chunk },
+			wantErr: errAny,
+		},
+		{
+			name: "short write on the first chunk",
+			reply: func(i int, req SMBRequest) chunkReply {
+				if i == 0 {
+					return chunkReply{delay: fast, written: &half}
+				}
+				return chunkReply{delay: late}
+			},
+			wantN:   func(int) int { return int(half) },
+			wantErr: io.ErrShortWrite,
+		},
+		{
+			name: "undecodable reply on the first chunk",
+			reply: func(i int, req SMBRequest) chunkReply {
+				if i == 0 {
+					return chunkReply{delay: fast, malformed: true}
+				}
+				return chunkReply{delay: late}
+			},
+			wantN:   func(int) int { return 0 },
+			wantErr: errAny,
+		},
+		{
+			name: "context cancelled mid-batch",
+			reply: func(i int, req SMBRequest) chunkReply {
+				return chunkReply{delay: late}
+			},
+			cancelAfter: 10 * time.Millisecond,
+			wantN:       func(chunk int) int { return 8 * chunk },
+			wantErr:     context.Canceled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newSlowServer(t, tc.reply)
+				f, conn := newDrainTestFile(s)
+				defer conn.Close()
+				defer s.replies.Wait()
+				go conn.Receive()
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if tc.cancelAfter > 0 {
+					time.AfterFunc(tc.cancelAfter, cancel)
+				}
+
+				n, err := f.Write(make([]byte, 512<<10), ctx)
+
+				if want := tc.wantN(f.maxWriteChunk()); n != want {
+					t.Errorf("Write() n = %d, want %d", n, want)
+				}
+				switch {
+				case tc.wantErr == errAny:
+					if err == nil {
+						t.Errorf("Write() error = nil, want a write failure")
+					}
+				case !errors.Is(err, tc.wantErr):
+					t.Errorf("Write() error = %v, want %v", err, tc.wantErr)
+				}
+
+				if got := s.outstandingRequests(); got != 0 {
+					t.Errorf("Write() returned with %d writes still unanswered on the server", got)
+				}
+
+				if err := f.Close(context.Background()); err != nil {
+					t.Fatalf("Close() error = %v", err)
+				}
+				if s.closeSawMax != 0 {
+					t.Errorf("CLOSE reached the server with %d writes still pending on it", s.closeSawMax)
+				}
+			})
+		})
+	}
 }
