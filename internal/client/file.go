@@ -683,7 +683,7 @@ func (f *File) readAtChunk(buf []byte, offset int64, ctx context.Context) (int, 
 	header.UID = f.session.uid
 	header.TID = f.tid
 
-	resp, err := f.session.conn.sendRecv(header, params, data, ctx)
+	resp, err := f.session.conn.sendRecvSettled(header, params, data, ctx, readDrainTimeout)
 	if err != nil {
 		// If we got a response, check for EOF status
 		if resp != nil && resp.header.Status == smb1.STATUS_END_OF_FILE {
@@ -1102,7 +1102,7 @@ func (f *File) WriteAt(data []byte, offset int64, ctx context.Context) (int, err
 	header.UID = f.session.uid
 	header.TID = f.tid
 
-	resp, err := f.session.conn.sendRecv(header, params, writeData, ctx)
+	resp, err := f.session.conn.sendRecvSettled(header, params, writeData, ctx, writeDrainTimeout)
 	if err != nil {
 		return 0, fmt.Errorf("smb1: write failed: %w", err)
 	}

@@ -253,6 +253,46 @@ func (c *Conn) sendRecv(header *smb1.Header, params, data []byte, ctx context.Co
 	return resp, resp.err
 }
 
+// sendRecvSettled is sendRecv for a request the server carries out whatever
+// the caller does next, such as a READ_ANDX or WRITE_ANDX. If ctx ends while
+// the request is on the wire, it keeps waiting for the reply, for up to settle,
+// before returning ctx's error, so that the caller's next request on the file
+// (typically its CLOSE) never reaches the server while this one is still
+// pending there; Samba 4.13 and later crash the connection on that overlap.
+// A reply that does not arrive within settle is abandoned (see
+// pendingRequest).
+func (c *Conn) sendRecvSettled(header *smb1.Header, params, data []byte, ctx context.Context, settle time.Duration) (*response, error) {
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.awaitResponse(respCh, mid, ctx)
+	if err == nil {
+		finish(false)
+		return resp, resp.err
+	}
+	if ctx.Err() == nil {
+		// The connection went away; there is nothing left to wait for.
+		finish(false)
+		return nil, err
+	}
+
+	logging.FromContext(ctx).Debug("sendRecv: MID %d cancelled in flight, waiting up to %s for its reply", mid, settle)
+	timer := time.NewTimer(settle)
+	defer timer.Stop()
+	select {
+	case <-respCh:
+		finish(false)
+	case <-timer.C:
+		logging.FromContext(ctx).Warn("sendRecv: gave up after %s waiting for the reply to cancelled MID %d", settle, mid)
+		finish(true)
+	case <-c.done:
+		finish(false)
+	}
+	return nil, err
+}
+
 // awaitResponse waits for one message on respCh, honouring context
 // cancellation and connection teardown. The error status carried by the
 // message itself is left for the caller to act on.

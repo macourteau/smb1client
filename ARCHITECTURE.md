@@ -339,7 +339,9 @@ A pipelined read or write that stops before its last chunk — a short or empty
 reply, end of file, an error, a send failure, or cancellation — collects the
 replies to every request it had already sent before returning, bounded by
 `readDrainTimeout`/`writeDrainTimeout` (`collectReplies` in
-`internal/client/file.go`). Abandoning them would let the caller's next CLOSE
+`internal/client/file.go`). A single-request ReadAt or WriteAt cancelled while
+its request is on the wire likewise waits, bounded, for that reply
+(`sendRecvSettled`). Abandoning them would let the caller's next CLOSE
 reach the server while those requests are still pending there, and Samba 4.13
 and later crash the connection's smbd process on that overlap when reads and
 writes are served asynchronously (the default).

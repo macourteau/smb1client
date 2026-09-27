@@ -425,3 +425,67 @@ func TestFileWritePipelinedCollectsEveryReplyBeforeReturning(t *testing.T) {
 		})
 	}
 }
+
+// TestFileSingleRequestCancelSettlesBeforeReturning covers the unpipelined
+// transfers: a ReadAt or WriteAt cancelled while its one request is on the
+// wire waits for that request's reply before returning, bounded, so that a
+// Close straight after does not overlap it on the server either.
+func TestFileSingleRequestCancelSettlesBeforeReturning(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		reply    chunkReply
+		op       func(f *File, ctx context.Context) error
+		minDelay time.Duration // how long the call must have waited, at least
+		reserved int           // MIDs left reserved for a reply never sent
+	}{
+		{
+			name:     "ReadAt",
+			reply:    chunkReply{delay: 50 * time.Millisecond, data: make([]byte, 4096)},
+			op:       func(f *File, ctx context.Context) error { _, err := f.ReadAt(make([]byte, 4096), 0, ctx); return err },
+			minDelay: 50 * time.Millisecond,
+		},
+		{
+			name:     "WriteAt",
+			reply:    chunkReply{delay: 50 * time.Millisecond},
+			op:       func(f *File, ctx context.Context) error { _, err := f.WriteAt(make([]byte, 4096), 0, ctx); return err },
+			minDelay: 50 * time.Millisecond,
+		},
+		{
+			name:     "ReadAt against a server that never answers",
+			reply:    chunkReply{never: true},
+			op:       func(f *File, ctx context.Context) error { _, err := f.ReadAt(make([]byte, 4096), 0, ctx); return err },
+			minDelay: readDrainTimeout,
+			reserved: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newSlowServer(t, func(int, SMBRequest) chunkReply { return tc.reply })
+				f, conn := newDrainTestFile(s)
+				defer conn.Close()
+				defer s.replies.Wait()
+				go conn.Receive()
+
+				ctx, cancel := context.WithCancel(context.Background())
+				time.AfterFunc(10*time.Millisecond, cancel)
+
+				start := time.Now()
+				err := tc.op(f, ctx)
+				elapsed := time.Since(start)
+
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("error = %v, want context.Canceled", err)
+				}
+				if elapsed < tc.minDelay || elapsed > tc.minDelay+time.Second {
+					t.Errorf("returned after %v, want it to wait out the request in flight (%v)", elapsed, tc.minDelay)
+				}
+				if got := s.outstandingRequests(); got != tc.reserved {
+					t.Errorf("returned with %d requests unanswered on the server, want %d", got, tc.reserved)
+				}
+				if live, reserved := pendingByState(conn); len(live) != 0 || len(reserved) != tc.reserved {
+					t.Errorf("live MIDs %v, reserved %v; want none live and %d reserved", live, reserved, tc.reserved)
+				}
+			})
+		})
+	}
+}
