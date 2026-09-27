@@ -59,9 +59,18 @@ type response struct {
 // receive loop sees the late reply and discards it (or the connection closes):
 // the server answers an abandoned request all the same, and a MID reissued
 // meanwhile would have that reply delivered as the new request's answer.
+//
+// A transaction's reply may span several messages, each carrying the MID, and
+// nothing in a late one says whether more follow. So an abandoned transaction
+// keeps its MID until the connection closes: freeing it at the first late
+// fragment would let the rest be reassembled into whichever request was given
+// the MID next — for a directory listing, entries that are not its own. Each
+// such abandonment costs one of the 65,535 usable MIDs for the connection's
+// life, and allocateMID reports exhaustion as an error.
 type pendingRequest struct {
-	respCh    chan *response
-	cancelled bool
+	respCh      chan *response
+	cancelled   bool
+	transaction bool
 }
 
 // conn represents a connection to an SMB1 server.
@@ -240,7 +249,7 @@ func (c *Conn) send(header *smb1.Header, params, data []byte) error {
 // sendRecv sends an SMB1 request and waits for the response.
 // It supports context cancellation and timeouts.
 func (c *Conn) sendRecv(header *smb1.Header, params, data []byte, ctx context.Context) (*response, error) {
-	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx)
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +271,7 @@ func (c *Conn) sendRecv(header *smb1.Header, params, data []byte, ctx context.Co
 // A reply that does not arrive within settle is abandoned (see
 // pendingRequest).
 func (c *Conn) sendRecvSettled(header *smb1.Header, params, data []byte, ctx context.Context, settle time.Duration) (*response, error) {
-	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx)
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -345,14 +354,15 @@ func (c *Conn) awaitResponse(respCh <-chan *response, mid uint16, ctx context.Co
 // entries with no error to show for it, so keep reading until the accumulated
 // counts reach the totals.
 func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx context.Context) (*response, *smb1.Trans2Response, error) {
-	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx)
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Set when the wait for the next message is cut short by ctx; any other
-	// exit has had its answer, whole or failed.
-	abandoned := false
-	defer func() { finish(abandoned) }()
+	// Set once the server has sent the whole reply: every byte the totals
+	// promised, or an error status, which ends the transaction. Any other exit
+	// may leave fragments still on the way, so the request counts as abandoned.
+	complete := false
+	defer func() { finish(!complete) }()
 
 	logger := logging.FromContext(ctx)
 
@@ -372,8 +382,10 @@ func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx
 	for {
 		resp, err := c.awaitResponse(respCh, mid, ctx)
 		if err != nil {
-			abandoned = ctx.Err() != nil
 			return nil, nil, err
+		}
+		if resp.err != nil && resp.header.IsError() {
+			complete = true
 		}
 
 		frag, err := smb1.DecodeTrans2Response(resp.params, resp.data)
@@ -407,6 +419,7 @@ func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx
 		gotData += len(frag.Data)
 
 		if gotParams >= wantParams && gotData >= wantData {
+			complete = true
 			break
 		}
 
@@ -455,7 +468,7 @@ func placeFragment(buf, frag []byte, displacement uint16, what string) error {
 // The returned channel carries every message the server sends for that MID;
 // finish must be called once the caller is done reading, saying whether it
 // gave up waiting (see releaseLocked).
-func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx context.Context) (<-chan *response, uint16, func(abandoned bool), error) {
+func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx context.Context, transaction bool) (<-chan *response, uint16, func(abandoned bool), error) {
 	logger := logging.FromContext(ctx)
 
 	c.mu.Lock()
@@ -475,7 +488,7 @@ func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx contex
 	}
 	header.MID = mid
 	respCh := make(chan *response, responseQueueDepth)
-	c.pending[mid] = &pendingRequest{respCh: respCh, cancelled: false}
+	c.pending[mid] = &pendingRequest{respCh: respCh, transaction: transaction}
 	c.mu.Unlock()
 
 	// cleanup is for a request that never reached the wire, so nothing will
@@ -581,9 +594,11 @@ func (c *Conn) Receive() {
 			continue
 		}
 		if req.cancelled {
-			// The late reply to an abandoned request: discard it and free
-			// the MID it was holding.
-			delete(c.pending, header.MID)
+			// The late reply to an abandoned request: discard it, and free
+			// the MID it was holding unless more fragments may follow.
+			if !req.transaction {
+				delete(c.pending, header.MID)
+			}
 			c.mu.Unlock()
 			logger.Debug("Discarding late response for abandoned MID %d (command 0x%02X, status 0x%08X)",
 				header.MID, header.Command, header.Status)
@@ -646,6 +661,7 @@ func (c *Conn) setError(err error) {
 // releaseLocked settles a request its sender has finished with. An answered
 // request frees its MID. One the sender gave up on (abandoned) keeps the MID
 // reserved, marked cancelled, until the receive loop discards the late reply
+// (for a transaction, until the connection closes; see pendingRequest)
 // — unless that reply has in fact already been dispatched to respCh, which
 // the receive loop does under c.mu, so the check here cannot race it.
 // Must be called with c.mu held.
@@ -655,7 +671,9 @@ func (c *Conn) releaseLocked(mid uint16, respCh chan *response, abandoned bool) 
 		// Already released, or swept away by connection teardown.
 		return
 	}
-	if !abandoned || len(respCh) > 0 {
+	// A reply already in the channel settles a single-message request, but
+	// not a transaction, whose further fragments may still be coming.
+	if !abandoned || (len(respCh) > 0 && !req.transaction) {
 		delete(c.pending, mid)
 		return
 	}

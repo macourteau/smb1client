@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/macourteau/smb1client/internal/smb1"
 )
@@ -120,6 +122,119 @@ func TestAbandonedMIDIsNotReusedBeforeItsReply(t *testing.T) {
 				conn.mu.Unlock()
 				if stillHeld {
 					t.Errorf("MID %d still reserved after its late reply arrived", abandoned)
+				}
+			})
+		})
+	}
+}
+
+// TestAbandonedTransactionMIDStaysReserved covers the one reply that spans
+// several messages. A TRANS2 reply — a directory listing, most importantly —
+// may still have fragments on the way when its reader stops, and each carries
+// the same MID. Were that MID freed at the first late fragment, the ones after
+// it would be reassembled into whichever request was given the MID next: a
+// listing silently made of another listing's entries. So an abandoned
+// transaction keeps its MID for the life of the connection.
+func TestAbandonedTransactionMIDStaysReserved(t *testing.T) {
+	const total = 300
+	fragment := func(fill byte, disp, n int) ([]byte, []byte) {
+		return trans2Fragment(0, total, nil, bytes.Repeat([]byte{fill}, n), 0, disp)
+	}
+	reply := func(mock *EnhancedMockConn, mid uint16, params, data []byte) {
+		h := smb1.NewHeader(smb1.SMB_COM_TRANSACTION2)
+		h.MID = mid
+		h.Flags |= smb1.SMB_FLAGS_REPLY
+		mock.inner.addResponse(h, params, data)
+	}
+
+	for _, tc := range []struct {
+		name string
+		// stop ends the reader's interest after the first fragment arrived.
+		stop func(mock *EnhancedMockConn, mid uint16, cancel context.CancelFunc)
+	}{
+		{
+			name: "reader cancelled mid-reassembly",
+			stop: func(_ *EnhancedMockConn, _ uint16, cancel context.CancelFunc) { cancel() },
+		},
+		{
+			name: "reader failed mid-reassembly",
+			stop: func(mock *EnhancedMockConn, mid uint16, _ context.CancelFunc) {
+				// A fragment placed past the promised totals fails reassembly.
+				p, d := fragment(0xEE, total, 10)
+				reply(mock, mid, p, d)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				mock := newEnhancedMockConnWithLogging(t)
+				conn := NewConn(mock)
+				defer conn.Close()
+				go conn.Receive()
+
+				type result struct {
+					trans *smb1.Trans2Response
+					err   error
+				}
+				transact := func(ctx context.Context, done chan<- result) {
+					_, trans, err := conn.sendRecvTransaction(smb1.NewHeader(smb1.SMB_COM_TRANSACTION2), nil, nil, ctx)
+					done <- result{trans, err}
+				}
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				first := make(chan result, 1)
+				go transact(ctx, first)
+				synctest.Wait()
+				abandoned := mock.GetRequests()[0].MID
+
+				p, d := fragment(0xAA, 0, 100)
+				reply(mock, abandoned, p, d)
+				synctest.Wait()
+				tc.stop(mock, abandoned, cancel)
+				if got := <-first; got.err == nil {
+					t.Fatalf("abandoned transaction returned no error")
+				}
+
+				// One late fragment lands, then allocation comes round to the
+				// abandoned MID while another is still on its way.
+				p, d = fragment(0xAA, 100, 100)
+				reply(mock, abandoned, p, d)
+				synctest.Wait()
+				conn.mu.Lock()
+				conn.nextMID = abandoned
+				conn.mu.Unlock()
+
+				second := make(chan result, 1)
+				go transact(context.Background(), second)
+				synctest.Wait()
+				reqs := mock.GetRequests()
+				fresh := reqs[len(reqs)-1].MID
+				if fresh == abandoned {
+					t.Errorf("new transaction was given MID %d while the abandoned one's fragments were still arriving", fresh)
+				}
+
+				p, d = fragment(0xAA, 200, 100)
+				reply(mock, abandoned, p, d)
+				synctest.Wait()
+				want := bytes.Repeat([]byte{0x55}, 50)
+				p, d = trans2Fragment(0, len(want), nil, want, 0, 0)
+				reply(mock, fresh, p, d)
+
+				select {
+				case got := <-second:
+					if got.err != nil {
+						t.Fatalf("new transaction failed: %v", got.err)
+					}
+					if !bytes.Equal(got.trans.Data, want) {
+						t.Errorf("new transaction reassembled %d bytes not its own reply; late fragments leaked in", len(got.trans.Data))
+					}
+				case <-time.After(time.Minute):
+					t.Fatal("new transaction never completed; late fragments were taken as its reply")
+				}
+
+				if _, reserved := pendingByState(conn); len(reserved) != 1 || reserved[0] != abandoned {
+					t.Errorf("reserved MIDs %v, want the abandoned transaction's %d held for the connection's life", reserved, abandoned)
 				}
 			})
 		})

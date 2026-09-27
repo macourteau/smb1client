@@ -480,7 +480,7 @@ func TestBeginRequestCancelledContextLeavesConnectionUsable(t *testing.T) {
 	cancel()
 
 	header := smb1.NewHeader(smb1.SMB_COM_ECHO)
-	_, _, _, err := c.beginRequest(header, nil, nil, ctx)
+	_, _, _, err := c.beginRequest(header, nil, nil, ctx, false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("beginRequest() error = %v, want it to wrap context.Canceled", err)
 	}
@@ -496,7 +496,7 @@ func TestBeginRequestCancelledContextLeavesConnectionUsable(t *testing.T) {
 	}
 
 	// The connection must still accept work on a live context.
-	if _, _, _, err := c.beginRequest(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background()); err != nil {
+	if _, _, _, err := c.beginRequest(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background(), false); err != nil {
 		t.Errorf("beginRequest() on a live context after a cancelled one failed: %v", err)
 	}
 }

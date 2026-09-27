@@ -364,7 +364,12 @@ A request whose sender stopped waiting (its context was cancelled, or a
 pipelined drain gave up) is not forgotten: it stays in the pending map marked
 cancelled, keeping its MID out of `allocateMID`'s reach, until the loop sees
 its late reply and discards it or the connection closes. Reissuing the MID
-sooner would deliver that late reply as some other request's answer.
+sooner would deliver that late reply as some other request's answer. A
+TRANS2/TRANSACTION reply can span several messages with nothing marking the
+last, so a transaction abandoned before its reply was complete (cancelled or
+failed mid-reassembly) keeps its MID until the connection closes; a listing can
+then never absorb fragments of another. That costs one MID per such
+abandonment for the connection's life.
 `allocateMID` makes one pass over the ID space and returns an error if every
 MID is held.
 
