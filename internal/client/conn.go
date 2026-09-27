@@ -26,6 +26,13 @@ import (
 // testing for io.EOF would misread it as one.
 var ErrConnectionClosed = fmt.Errorf("smb1: connection closed: %w", net.ErrClosed)
 
+// ErrMIDsExhausted reports that every message ID is held, almost always by
+// abandoned requests still reserving theirs for replies that never came (see
+// pendingRequest). Such a connection can issue nothing further, so it is torn
+// down, and the error wraps ErrConnectionClosed so that callers treat it like
+// any other dead connection and dial again.
+var ErrMIDsExhausted = fmt.Errorf("smb1: every message ID is held by a request awaiting its reply: %w", ErrConnectionClosed)
+
 const (
 	// responseQueueDepth is how many response messages may be buffered for a
 	// single in-flight request before the receive loop starts dropping them.
@@ -53,11 +60,24 @@ type response struct {
 }
 
 // pendingRequest tracks a request waiting for a response.
-// It includes a cancellation flag to coordinate cleanup between
-// the sender and the Receive goroutine.
+//
+// cancelled marks a request whose sender stopped waiting before the server
+// answered. Its entry stays in the pending map, holding the MID, until the
+// receive loop sees the late reply and discards it (or the connection closes):
+// the server answers an abandoned request all the same, and a MID reissued
+// meanwhile would have that reply delivered as the new request's answer.
+//
+// A transaction's reply may span several messages, each carrying the MID, and
+// nothing in a late one says whether more follow. So an abandoned transaction
+// keeps its MID until the connection closes: freeing it at the first late
+// fragment would let the rest be reassembled into whichever request was given
+// the MID next — for a directory listing, entries that are not its own. Each
+// such abandonment costs one of the 65,535 usable MIDs for the connection's
+// life; running out tears the connection down (see ErrMIDsExhausted).
 type pendingRequest struct {
-	respCh    chan *response
-	cancelled bool
+	respCh      chan *response
+	cancelled   bool
+	transaction bool
 }
 
 // conn represents a connection to an SMB1 server.
@@ -167,7 +187,9 @@ func (c *Conn) Close() error {
 
 // allocateMID allocates the next available message ID.
 // Message IDs wrap around at uint16 max (65535).
-// Returns an error if all 65536 MIDs are already in use by concurrent requests.
+// A MID held by a pending request, including one abandoned and still awaiting
+// its late reply, is skipped. If a single pass over the ID space finds every
+// MID held, the connection is torn down and ErrMIDsExhausted returned.
 // Must be called with c.mu held.
 func (c *Conn) allocateMID() (uint16, error) {
 	start := c.nextMID
@@ -188,7 +210,13 @@ func (c *Conn) allocateMID() (uint16, error) {
 
 		// Wrapped around without finding free MID
 		if c.nextMID == start {
-			return 0, fmt.Errorf("smb1: no available message IDs (>65535 concurrent requests)")
+			c.logger.Warn("Every message ID is held by a request awaiting its reply; closing the connection")
+			c.setErrorLocked(ErrMIDsExhausted)
+			// Closing the socket also ends the receive loop, which would
+			// otherwise wait on a healthy socket for replies that may never
+			// come. Closing a net.Conn takes no lock of ours.
+			c.netbiosConn.Close()
+			return 0, ErrMIDsExhausted
 		}
 	}
 }
@@ -234,17 +262,57 @@ func (c *Conn) send(header *smb1.Header, params, data []byte) error {
 // sendRecv sends an SMB1 request and waits for the response.
 // It supports context cancellation and timeouts.
 func (c *Conn) sendRecv(header *smb1.Header, params, data []byte, ctx context.Context) (*response, error) {
-	respCh, mid, cleanup, err := c.beginRequest(header, params, data, ctx)
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx, false)
 	if err != nil {
 		return nil, err
 	}
-	defer cleanup()
 
 	resp, err := c.awaitResponse(respCh, mid, ctx)
+	finish(err != nil && ctx.Err() != nil)
 	if err != nil {
 		return resp, err
 	}
 	return resp, resp.err
+}
+
+// sendRecvSettled is sendRecv for a request the server carries out whatever
+// the caller does next, such as a READ_ANDX or WRITE_ANDX. If ctx ends while
+// the request is on the wire, it keeps waiting for the reply, for up to settle,
+// before returning ctx's error, so that the caller's next request on the file
+// (typically its CLOSE) never reaches the server while this one is still
+// pending there; Samba 4.13 and later crash the connection on that overlap.
+// A reply that does not arrive within settle is abandoned (see
+// pendingRequest).
+func (c *Conn) sendRecvSettled(header *smb1.Header, params, data []byte, ctx context.Context, settle time.Duration) (*response, error) {
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.awaitResponse(respCh, mid, ctx)
+	if err == nil {
+		finish(false)
+		return resp, resp.err
+	}
+	if ctx.Err() == nil {
+		// The connection went away; there is nothing left to wait for.
+		finish(false)
+		return nil, err
+	}
+
+	logging.FromContext(ctx).Debug("sendRecv: MID %d cancelled in flight, waiting up to %s for its reply", mid, settle)
+	timer := time.NewTimer(settle)
+	defer timer.Stop()
+	select {
+	case <-respCh:
+		finish(false)
+	case <-timer.C:
+		logging.FromContext(ctx).Warn("sendRecv: gave up after %s waiting for the reply to cancelled MID %d", settle, mid)
+		finish(true)
+	case <-c.done:
+		finish(false)
+	}
+	return nil, err
 }
 
 // awaitResponse waits for one message on respCh, honouring context
@@ -299,11 +367,15 @@ func (c *Conn) awaitResponse(respCh <-chan *response, mid uint16, ctx context.Co
 // entries with no error to show for it, so keep reading until the accumulated
 // counts reach the totals.
 func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx context.Context) (*response, *smb1.Trans2Response, error) {
-	respCh, mid, cleanup, err := c.beginRequest(header, params, data, ctx)
+	respCh, mid, finish, err := c.beginRequest(header, params, data, ctx, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer cleanup()
+	// Set once the server has sent the whole reply: every byte the totals
+	// promised, or an error status, which ends the transaction. Any other exit
+	// may leave fragments still on the way, so the request counts as abandoned.
+	complete := false
+	defer func() { finish(!complete) }()
 
 	logger := logging.FromContext(ctx)
 
@@ -324,6 +396,9 @@ func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx
 		resp, err := c.awaitResponse(respCh, mid, ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+		if resp.err != nil && resp.header.IsError() {
+			complete = true
 		}
 
 		frag, err := smb1.DecodeTrans2Response(resp.params, resp.data)
@@ -357,6 +432,7 @@ func (c *Conn) sendRecvTransaction(header *smb1.Header, params, data []byte, ctx
 		gotData += len(frag.Data)
 
 		if gotParams >= wantParams && gotData >= wantData {
+			complete = true
 			break
 		}
 
@@ -403,8 +479,9 @@ func placeFragment(buf, frag []byte, displacement uint16, what string) error {
 
 // beginRequest allocates a MID, registers the request as pending and sends it.
 // The returned channel carries every message the server sends for that MID;
-// cleanup unregisters it and must be called once the caller is done reading.
-func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx context.Context) (<-chan *response, uint16, func(), error) {
+// finish must be called once the caller is done reading, saying whether it
+// gave up waiting (see releaseLocked).
+func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx context.Context, transaction bool) (<-chan *response, uint16, func(abandoned bool), error) {
 	logger := logging.FromContext(ctx)
 
 	c.mu.Lock()
@@ -424,13 +501,20 @@ func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx contex
 	}
 	header.MID = mid
 	respCh := make(chan *response, responseQueueDepth)
-	c.pending[mid] = &pendingRequest{respCh: respCh, cancelled: false}
+	c.pending[mid] = &pendingRequest{respCh: respCh, transaction: transaction}
 	c.mu.Unlock()
 
+	// cleanup is for a request that never reached the wire, so nothing will
+	// ever answer it.
 	cleanup := func() {
 		c.mu.Lock()
 		delete(c.pending, mid)
 		c.mu.Unlock()
+	}
+	finish := func(abandoned bool) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.releaseLocked(mid, respCh, abandoned)
 	}
 
 	logger.Debug("sendRecv: sending SMB command 0x%02X with MID %d", header.Command, mid)
@@ -452,7 +536,7 @@ func (c *Conn) beginRequest(header *smb1.Header, params, data []byte, ctx contex
 		return nil, 0, nil, err
 	}
 
-	return respCh, mid, cleanup, nil
+	return respCh, mid, finish, nil
 }
 
 // Receive is the background goroutine that reads responses and dispatches them to waiters.
@@ -497,7 +581,18 @@ func (c *Conn) Receive() {
 			continue
 		}
 
-		// Dispatch to waiting request
+		resp := &response{
+			header: header,
+			params: params,
+			data:   data,
+		}
+		if header.IsError() {
+			resp.err = header.Error()
+		}
+
+		// Dispatch to waiting request. The hand-off happens under c.mu so
+		// that releaseLocked sees, atomically, either the reply already in
+		// the channel or a request still waiting for one.
 		c.mu.Lock()
 		req, ok := c.pending[header.MID]
 		if !ok {
@@ -512,32 +607,24 @@ func (c *Conn) Receive() {
 			continue
 		}
 		if req.cancelled {
-			// Request was cancelled - remove from pending map and discard response
-			delete(c.pending, header.MID)
+			// The late reply to an abandoned request: discard it, and free
+			// the MID it was holding unless more fragments may follow.
+			if !req.transaction {
+				delete(c.pending, header.MID)
+			}
 			c.mu.Unlock()
+			logger.Debug("Discarding late response for abandoned MID %d (command 0x%02X, status 0x%08X)",
+				header.MID, header.Command, header.Status)
 			continue
 		}
-		respCh := req.respCh
-		c.mu.Unlock()
 
-		// Build response
-		resp := &response{
-			header: header,
-			params: params,
-			data:   data,
-		}
-
-		// Check for SMB error status
-		if header.IsError() {
-			resp.err = header.Error()
-		}
-
-		// Send to waiter (non-blocking)
+		// Send to waiter (non-blocking, so holding c.mu here cannot stall)
 		select {
-		case respCh <- resp:
+		case req.respCh <- resp:
 		default:
-			// Channel full or closed - waiter gave up
+			// Channel full - waiter gave up
 		}
+		c.mu.Unlock()
 	}
 }
 
@@ -560,7 +647,11 @@ func (c *Conn) connError() error {
 func (c *Conn) setError(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.setErrorLocked(err)
+}
 
+// setErrorLocked is setError for a caller already holding c.mu.
+func (c *Conn) setErrorLocked(err error) {
 	select {
 	case <-c.done:
 		// Already closed
@@ -584,19 +675,26 @@ func (c *Conn) setError(err error) {
 	close(c.done)
 }
 
-// cleanupCancelledRequests removes all cancelled requests from the pending map.
-// This is safe to call because cancelled requests will never receive responses
-// (Receive() skips them). This is primarily used after operations are cancelled
-// to prevent memory leaks.
-func (c *Conn) cleanupCancelledRequests() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for mid, req := range c.pending {
-		if req.cancelled {
-			delete(c.pending, mid)
-		}
+// releaseLocked settles a request its sender has finished with. An answered
+// request frees its MID. One the sender gave up on (abandoned) keeps the MID
+// reserved, marked cancelled, until the receive loop discards the late reply
+// (for a transaction, until the connection closes; see pendingRequest)
+// — unless that reply has in fact already been dispatched to respCh, which
+// the receive loop does under c.mu, so the check here cannot race it.
+// Must be called with c.mu held.
+func (c *Conn) releaseLocked(mid uint16, respCh chan *response, abandoned bool) {
+	req, ok := c.pending[mid]
+	if !ok || req.respCh != respCh {
+		// Already released, or swept away by connection teardown.
+		return
 	}
+	// A reply already in the channel settles a single-message request, but
+	// not a transaction, whose further fragments may still be coming.
+	if !abandoned || (len(respCh) > 0 && !req.transaction) {
+		delete(c.pending, mid)
+		return
+	}
+	req.cancelled = true
 }
 
 // ServerName returns the server's NetBIOS name discovered during negotiation.

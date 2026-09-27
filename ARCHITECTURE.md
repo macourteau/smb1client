@@ -335,6 +335,17 @@ MaxMpxCount (capped client-side). Without CAP_LARGE_READX a read chunk is at
 most 65,520 bytes (uint16 length field); with it, 130,048 bytes (127 KiB).
 Write chunks are 130,048 bytes.
 
+A pipelined read or write that stops before its last chunk — a short or empty
+reply, end of file, an error, a send failure, or cancellation — collects the
+replies to every request it had already sent before returning, bounded by
+`readDrainTimeout`/`writeDrainTimeout` (`collectReplies` in
+`internal/client/file.go`). A single-request ReadAt or WriteAt cancelled while
+its request is on the wire likewise waits, bounded, for that reply
+(`sendRecvSettled`). Abandoning them would let the caller's next CLOSE
+reach the server while those requests are still pending there, and Samba 4.13
+and later crash the connection's smbd process on that overlap when reads and
+writes are served asynchronously (the default).
+
 ### Background Receive Loop
 
 ```
@@ -348,6 +359,20 @@ Connection Goroutine (receive loop):
     6. Send response to channel
     7. Remove MID from pending map
 ```
+
+A request whose sender stopped waiting (its context was cancelled, or a
+pipelined drain gave up) is not forgotten: it stays in the pending map marked
+cancelled, keeping its MID out of `allocateMID`'s reach, until the loop sees
+its late reply and discards it or the connection closes. Reissuing the MID
+sooner would deliver that late reply as some other request's answer. A
+TRANS2/TRANSACTION reply can span several messages with nothing marking the
+last, so a transaction abandoned before its reply was complete (cancelled or
+failed mid-reassembly) keeps its MID until the connection closes; a listing can
+then never absorb fragments of another. That costs one MID per such
+abandonment for the connection's life.
+`allocateMID` makes one pass over the ID space; if every MID is held it tears
+the connection down and returns `ErrMIDsExhausted`, which wraps
+`ErrConnectionClosed` so callers redial as for any dead connection.
 
 ### Request/Response Pattern
 

@@ -42,6 +42,17 @@ const SMBProtocolOverhead = 1024
 // caller that resumes from it rewrites a range that is already there.
 const writeDrainTimeout = 30 * time.Second
 
+// readDrainTimeout bounds how long a pipelined read that stopped early waits
+// for the replies to the requests it had already sent (see collectReplies).
+//
+// Samba 4.13 and later crash the connection on a CLOSE that arrives while
+// asynchronous reads are pending (reply_close defers the close and then
+// dereferences a NULL fsp), which is why those replies are waited for at all.
+// Each is at most one chunk the server has already been asked for, so a live
+// server answers well inside this bound; it exists so that one that never does
+// cannot hold a Read forever.
+const readDrainTimeout = 30 * time.Second
+
 // maxPipelineDepth caps how many requests this client keeps in flight, however
 // high a server advertises its MaxMpxCount.
 const maxPipelineDepth = 50
@@ -116,21 +127,32 @@ type File struct {
 	mu      sync.Mutex // protects offset
 }
 
+// wireRequest is the part of a pipelined chunk that identifies its request on
+// the wire, shared so that reads and writes settle abandoned chunks the same
+// way.
+type wireRequest struct {
+	mid    uint16
+	respCh chan *response
+}
+
+func (w *wireRequest) wire() *wireRequest { return w }
+
+// pipelinedChunk is a readChunk or a writeChunk.
+type pipelinedChunk interface{ wire() *wireRequest }
+
 // readChunk represents a chunk of data to be read in a pipelined read operation
 type readChunk struct {
+	wireRequest
 	offset    int64
 	size      int
 	bufOffset int
-	mid       uint16
-	respCh    chan *response
 }
 
 // writeChunk represents a chunk of data to be written in a pipelined write operation
 type writeChunk struct {
+	wireRequest
 	offset int64
 	data   []byte
-	mid    uint16
-	respCh chan *response
 }
 
 // FileStat represents file metadata returned by File.Stat().
@@ -324,9 +346,6 @@ func (f *File) readSequential(buf []byte, offset int64, ctx context.Context) (in
 func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
 
-	// Ensure cancelled requests are cleaned up when function exits
-	defer f.session.conn.cleanupCancelledRequests()
-
 	maxDataPerRead := f.maxReadChunk()
 
 	// Calculate number of chunks needed
@@ -355,7 +374,9 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 			offset:    offset + int64(chunkOffset),
 			size:      chunkSize,
 			bufOffset: chunkOffset,
-			respCh:    make(chan *response, 1),
+			wireRequest: wireRequest{
+				respCh: make(chan *response, 1),
+			},
 		}
 	}
 
@@ -371,33 +392,13 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 	}
 
 	if sendErr != nil {
-		// Mark any successfully allocated MIDs as cancelled
-		f.session.conn.mu.Lock()
-		for i := 0; i < sent; i++ {
-			if req, ok := f.session.conn.pending[chunks[i].mid]; ok {
-				req.cancelled = true
-			}
-		}
-		f.session.conn.mu.Unlock()
+		collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[:sent], sendErr)
 		return 0, sendErr
 	}
 
 	// Process responses and send remaining requests
 	totalRead := 0
 	nextToSend := maxPipeline
-
-	// Helper function to mark pending requests as cancelled.
-	// The Receive() goroutine will check this flag and skip sending responses.
-	// Cleanup (deletion from pending map) happens when responses arrive or on connection close.
-	cleanupPending := func(startFrom int, endAt int) {
-		f.session.conn.mu.Lock()
-		for j := startFrom; j < endAt; j++ {
-			if req, ok := f.session.conn.pending[chunks[j].mid]; ok {
-				req.cancelled = true
-			}
-		}
-		f.session.conn.mu.Unlock()
-	}
 
 	for i := 0; i < numChunks; i++ {
 		// Only process chunks that were actually sent
@@ -419,13 +420,8 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 			delete(f.session.conn.pending, chunk.mid)
 			f.session.conn.mu.Unlock()
 		case <-ctx.Done():
-			// Mark current chunk and all pending requests as cancelled
-			f.session.conn.mu.Lock()
-			if req, ok := f.session.conn.pending[chunk.mid]; ok {
-				req.cancelled = true
-			}
-			f.session.conn.mu.Unlock()
-			cleanupPending(i+1, nextToSend)
+			// The current chunk is still in flight too.
+			collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[i:nextToSend], ctx.Err())
 			return totalRead, ctx.Err()
 		case <-f.session.conn.done:
 			// Connection closed - setError() or Close() will clean up all pending MIDs
@@ -436,23 +432,20 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		// Handle response error
 		if resp.err != nil {
 			if resp.header != nil && resp.header.Status == smb1.STATUS_END_OF_FILE {
-				// EOF reached - clean up remaining pending requests
-				cleanupPending(i+1, nextToSend)
+				collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[i+1:nextToSend], io.EOF)
 				if totalRead > 0 {
 					return totalRead, nil
 				}
 				return 0, io.EOF
 			}
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[i+1:nextToSend], resp.err)
 			return totalRead, fmt.Errorf("smb1: read failed: %w", resp.err)
 		}
 
 		// Decode response
 		readResp, err := smb1.DecodeReadResponse(resp.params, resp.data)
 		if err != nil {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[i+1:nextToSend], err)
 			return totalRead, fmt.Errorf("smb1: failed to decode read response: %w", err)
 		}
 
@@ -466,8 +459,7 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		// hole. The io.Reader contract permits a short read, so the caller
 		// resumes from the advanced offset.
 		if n < chunk.size {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[i+1:nextToSend], fmt.Errorf("short reply of %d/%d bytes", n, chunk.size))
 			if totalRead > 0 {
 				// Per io.Reader contract: return data with nil error,
 				// next Read() will return (0, io.EOF)
@@ -479,8 +471,9 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		// Send next request if any remain
 		if nextToSend < numChunks {
 			if err := f.sendReadRequest(chunks[nextToSend], ctx); err != nil {
-				// Clean up remaining pending requests (including the one we just failed to send)
-				cleanupPending(i+1, nextToSend)
+				// The failed request was never registered; the ones before it
+				// were.
+				collectReplies(ctx, f.session.conn, readDrainTimeout, chunks[i+1:nextToSend], err)
 				return totalRead, err
 			}
 			nextToSend++
@@ -488,6 +481,58 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 	}
 
 	return totalRead, nil
+}
+
+// collectReplies waits, up to timeout, for the replies to pipelined chunks
+// that were sent but whose outcome is no longer wanted, because the transfer
+// stopped early for the reason given.
+//
+// Those requests are still pending on the server, and a caller that closes the
+// file next would have its CLOSE arrive while they are. Samba 4.13 and later
+// serve reads and writes asynchronously and crash the connection's smbd
+// process on exactly that overlap, so the replies are collected before the
+// transfer returns. The wait deliberately ignores ctx: a caller that cancelled
+// is the one most likely to close the file next. The bound exists so that a
+// server that never answers cannot hold the caller forever; the requests it
+// leaves unanswered are abandoned.
+func collectReplies[C pipelinedChunk](ctx context.Context, conn *Conn, timeout time.Duration, chunks []C, cause error) {
+	if len(chunks) == 0 {
+		return
+	}
+	logger := logging.FromContext(ctx)
+	logger.Debug("pipelined transfer stopped early (%v), collecting %d replies still in flight", cause, len(chunks))
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for i, chunk := range chunks {
+		w := chunk.wire()
+		select {
+		case <-w.respCh:
+			conn.mu.Lock()
+			delete(conn.pending, w.mid)
+			conn.mu.Unlock()
+		case <-deadline.C:
+			logger.Warn("pipelined transfer gave up after %s waiting for %d replies; the server may still hold them",
+				timeout, len(chunks)-i)
+			abandonChunks(conn, chunks[i:])
+			return
+		case <-conn.done:
+			// Teardown wakes and unregisters every pending request itself.
+			return
+		}
+	}
+}
+
+// abandonChunks gives up on the replies to chunks still on the wire. Their
+// MIDs stay reserved until those replies arrive (see pendingRequest).
+func abandonChunks[C pipelinedChunk](conn *Conn, chunks []C) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	for _, chunk := range chunks {
+		w := chunk.wire()
+		conn.releaseLocked(w.mid, w.respCh, true)
+	}
 }
 
 // sendReadRequest sends a single pipelined read request
@@ -638,7 +683,7 @@ func (f *File) readAtChunk(buf []byte, offset int64, ctx context.Context) (int, 
 	header.UID = f.session.uid
 	header.TID = f.tid
 
-	resp, err := f.session.conn.sendRecv(header, params, data, ctx)
+	resp, err := f.session.conn.sendRecvSettled(header, params, data, ctx, readDrainTimeout)
 	if err != nil {
 		// If we got a response, check for EOF status
 		if resp != nil && resp.header.Status == smb1.STATUS_END_OF_FILE {
@@ -754,9 +799,6 @@ func (f *File) writeSequential(data []byte, offset int64, ctx context.Context) (
 func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
 
-	// Ensure cancelled requests are cleaned up when function exits
-	defer f.session.conn.cleanupCancelledRequests()
-
 	maxDataPerWrite := f.maxWriteChunk()
 
 	// Calculate number of chunks needed
@@ -784,7 +826,9 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		chunks[i] = &writeChunk{
 			offset: offset + int64(chunkOffset),
 			data:   data[chunkOffset : chunkOffset+chunkSize],
-			respCh: make(chan *response, 1),
+			wireRequest: wireRequest{
+				respCh: make(chan *response, 1),
+			},
 		}
 	}
 
@@ -807,19 +851,6 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 	totalWritten := 0
 	nextToSend := sent
 
-	// Helper function to mark pending requests as cancelled.
-	// The Receive() goroutine will check this flag and skip sending responses.
-	// Cleanup (deletion from pending map) happens when responses arrive or on connection close.
-	cleanupPending := func(startFrom int, endAt int) {
-		f.session.conn.mu.Lock()
-		for j := startFrom; j < endAt; j++ {
-			if req, ok := f.session.conn.pending[chunks[j].mid]; ok {
-				req.cancelled = true
-			}
-		}
-		f.session.conn.mu.Unlock()
-	}
-
 	// draining records that no further chunks will be dispatched, either
 	// because the caller gave up or because a send failed. The chunks already
 	// on the wire are still waited for under the bounded deadline abortCh
@@ -827,6 +858,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 	// what make the returned count truthful. See writeDrainTimeout.
 	draining := false
 	var abortCh <-chan time.Time
+	var drainDeadline time.Time
 	var deferredErr error
 
 	stopFeeding := func(cause error) {
@@ -834,6 +866,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 			return
 		}
 		draining = true
+		drainDeadline = time.Now().Add(writeDrainTimeout)
 		abortCh = time.After(writeDrainTimeout)
 		// A send that failed only because the caller gave up is reported as the
 		// cancellation it was, so callers can classify it the usual way rather
@@ -875,6 +908,17 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 		}
 	}
 
+	// settleRest collects the replies to the chunks after i, within what is
+	// left of a drain already under way, so one Write never waits longer than
+	// writeDrainTimeout in all.
+	settleRest := func(i int, cause error) {
+		timeout := writeDrainTimeout
+		if draining {
+			timeout = max(time.Until(drainDeadline), 0)
+		}
+		collectReplies(ctx, f.session.conn, timeout, chunks[i+1:nextToSend], cause)
+	}
+
 	for i := 0; i < numChunks; i++ {
 		// Only process chunks that were actually sent
 		// Chunks 0..sent-1 were sent in initial batch
@@ -888,7 +932,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 
 		resp, err := awaitChunk(chunk)
 		if err != nil {
-			cleanupPending(i, nextToSend)
+			abandonChunks(f.session.conn, chunks[i:nextToSend])
 			return totalWritten, err
 		}
 
@@ -899,16 +943,14 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 
 		// Handle response error
 		if resp.err != nil {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			settleRest(i, resp.err)
 			return totalWritten, fmt.Errorf("smb1: write failed: %w", resp.err)
 		}
 
 		// Decode response
 		writeResp, decodeErr := smb1.DecodeWriteResponse(resp.params, resp.data)
 		if decodeErr != nil {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			settleRest(i, decodeErr)
 			return totalWritten, fmt.Errorf("smb1: failed to decode write response: %w", decodeErr)
 		}
 
@@ -918,8 +960,7 @@ func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (i
 
 		// If we wrote less than requested, it's an error
 		if bytesWritten < len(chunk.data) {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			settleRest(i, io.ErrShortWrite)
 			return totalWritten, io.ErrShortWrite
 		}
 
@@ -1074,7 +1115,7 @@ func (f *File) WriteAt(data []byte, offset int64, ctx context.Context) (int, err
 	header.UID = f.session.uid
 	header.TID = f.tid
 
-	resp, err := f.session.conn.sendRecv(header, params, writeData, ctx)
+	resp, err := f.session.conn.sendRecvSettled(header, params, writeData, ctx, writeDrainTimeout)
 	if err != nil {
 		return 0, fmt.Errorf("smb1: write failed: %w", err)
 	}

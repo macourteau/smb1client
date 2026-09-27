@@ -1282,3 +1282,73 @@ func TestDir_ReadDirAcceptsDotAsShareRoot(t *testing.T) {
 			len(fromDot), len(fromEmpty))
 	}
 }
+
+// TestFile_CopyThenCloseKeepsSessionAlive copies files the way io.CopyBuffer
+// does with a large buffer, closes each, and then uses the same session again.
+//
+// A 512 KiB buffer makes every Read a pipelined batch of eight READ_ANDX
+// requests, and the last Read of every file — plus the one that discovers end
+// of file — stops early with requests still outstanding. A client that closes
+// the file without collecting their replies has the CLOSE reach smbd while its
+// asynchronous reads are pending, a path on which Samba 4.13 and later
+// dereference a NULL fsp and kill the connection. The operation after Close is
+// what notices: it fails on a dead session.
+func TestFile_CopyThenCloseKeepsSessionAlive(t *testing.T) {
+	session, cleanupSession := createTestSession(t)
+	defer cleanupSession()
+
+	share, cleanupShare := mountTestShare(t, session)
+	defer cleanupShare()
+
+	// Several chunks long and not a multiple of the chunk size, so the final
+	// Read ends on a short chunk with the rest of its batch in flight.
+	payload := make([]byte, 3<<20+12345)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand.Read failed: %v", err)
+	}
+
+	dir := fmt.Sprintf("copyclose_%d", time.Now().UnixNano())
+	if err := share.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir(%q) failed: %v", dir, err)
+	}
+	defer share.RemoveAll(dir)
+
+	const files = 20
+	names := make([]string, files)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s/frame_%02d.fit", dir, i)
+		if err := share.WriteFile(names[i], payload, 0o644); err != nil {
+			t.Fatalf("WriteFile(%q) failed: %v", names[i], err)
+		}
+	}
+
+	buf := make([]byte, 512<<10)
+	for _, name := range names {
+		f, err := share.Open(name)
+		if err != nil {
+			t.Fatalf("Open(%q) failed: %v", name, err)
+		}
+
+		// Hide WriterTo and ReaderFrom so io.CopyBuffer really reads through
+		// buf rather than delegating to File's own buffer size.
+		var got bytes.Buffer
+		n, err := io.CopyBuffer(struct{ io.Writer }{&got}, struct{ io.Reader }{f}, buf)
+		if err != nil {
+			f.Close()
+			t.Fatalf("copying %q failed after %d bytes: %v", name, n, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close(%q) failed: %v", name, err)
+		}
+		if !bytes.Equal(got.Bytes(), payload) {
+			t.Fatalf("%q read back %d bytes that do not match the %d written", name, got.Len(), len(payload))
+		}
+
+		if _, err := share.Stat(name); err != nil {
+			t.Fatalf("Stat(%q) after Close failed: %v", name, err)
+		}
+		if _, err := share.ReadDir(dir); err != nil {
+			t.Fatalf("ReadDir(%q) after closing %q failed: %v", dir, name, err)
+		}
+	}
+}

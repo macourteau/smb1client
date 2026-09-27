@@ -23,8 +23,13 @@ func TestConnectionClosedIsClassifiableAsNetworkError(t *testing.T) {
 	}{
 		{"client", client.ErrConnectionClosed},
 		{"netbios", netbios.ErrConnectionClosed},
+		{"message IDs exhausted", client.ErrMIDsExhausted},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var transportErr *TransportError
+			if !errors.As(wrapError(tc.err), &transportErr) {
+				t.Errorf("wrapError(%v) is not a *TransportError", tc.err)
+			}
 			if !IsNetworkError(tc.err) {
 				t.Errorf("IsNetworkError(%v) = false, want true", tc.err)
 			}
