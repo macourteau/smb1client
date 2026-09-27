@@ -281,13 +281,32 @@ func TestFileReadPipelinedDrainGivesUp(t *testing.T) {
 			t.Errorf("%d reads unanswered on the server, want only the silent one", got)
 		}
 
-		conn.mu.Lock()
-		pending := len(conn.pending)
-		conn.mu.Unlock()
-		if pending != 0 {
-			t.Errorf("%d MIDs still registered after the drain gave up", pending)
+		// The silent request keeps its MID until its reply finally lands.
+		live, reserved := pendingByState(conn)
+		if len(live) != 0 || len(reserved) != 1 {
+			t.Fatalf("after the drain gave up: live MIDs %v, reserved %v; want none live and the silent one reserved", live, reserved)
+		}
+		s.mock.inner.addResponse(CreateReadResponse(reserved[0], make([]byte, 10)))
+		synctest.Wait()
+		if live, reserved := pendingByState(conn); len(live)+len(reserved) != 0 {
+			t.Errorf("after the late reply: live MIDs %v, reserved %v; want the MID freed", live, reserved)
 		}
 	})
+}
+
+// pendingByState splits the MIDs registered on conn into those still waited
+// for and those reserved for the late reply to an abandoned request.
+func pendingByState(conn *Conn) (live, reserved []uint16) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	for mid, req := range conn.pending {
+		if req.cancelled {
+			reserved = append(reserved, mid)
+		} else {
+			live = append(live, mid)
+		}
+	}
+	return live, reserved
 }
 
 // TestFileWritePipelinedCollectsEveryReplyBeforeReturning is the write-side

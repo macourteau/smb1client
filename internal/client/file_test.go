@@ -1055,8 +1055,9 @@ func TestFileReaddirEOF(t *testing.T) {
 	t.Skip("Requires complex TRANS2 response mocking - integration test required")
 }
 
-// TestFileReadPipelinedMIDCleanupOnCancel verifies that all allocated MIDs
-// are properly cleaned up when a pipelined read is cancelled via context.
+// TestFileReadPipelinedMIDCleanupOnCancel verifies that every allocated MID
+// is accounted for when a pipelined read is cancelled via context: none is left
+// waiting, and those never answered stay reserved for their late replies.
 //
 // This test validates the MID cleanup fixes for:
 // 1. Context cancellation not cleaning up the current chunk's MID
@@ -1130,25 +1131,23 @@ func TestFileReadPipelinedMIDCleanupOnCancel(t *testing.T) {
 		// wait for the requests already sent gives up (see readDrainTimeout).
 		<-readDone
 
-		// Verify all MIDs were cleaned up
-		tree.Session.conn.mu.Lock()
-		remaining := len(tree.Session.conn.pending)
-		remainingMIDs := make([]uint16, 0, len(tree.Session.conn.pending))
-		for mid := range tree.Session.conn.pending {
-			remainingMIDs = append(remainingMIDs, mid)
+		// The requests this server never answered keep their MIDs reserved
+		// for the late replies, so nothing may be left waiting live.
+		live, reserved := pendingByState(tree.Session.conn)
+		t.Logf("MIDs after cancellation: live %v, reserved %v", live, reserved)
+		if len(reserved) != midsAllocated {
+			t.Errorf("%d MIDs reserved for late replies, want the %d never answered", len(reserved), midsAllocated)
 		}
-		t.Logf("MIDs remaining after cancellation: %d (MIDs: %v)", remaining, remainingMIDs)
-		tree.Session.conn.mu.Unlock()
 
-		// The critical assertion: no MID leaks
-		if remaining != 0 {
-			t.Errorf("MID leak detected: %d MIDs still pending after context cancellation (expected 0, got MIDs: %v)", remaining, remainingMIDs)
+		if len(live) != 0 {
+			t.Errorf("MID leak detected: %v still waiting after the operation returned", live)
 		}
 	})
 }
 
-// TestFileWritePipelinedMIDCleanupOnCancel verifies that all allocated MIDs
-// are properly cleaned up when a pipelined write is cancelled via context.
+// TestFileWritePipelinedMIDCleanupOnCancel verifies that every allocated MID
+// is accounted for when a pipelined write is cancelled via context: none is left
+// waiting, and those never answered stay reserved for their late replies.
 //
 // This test validates the MID cleanup fixes for:
 // 1. Context cancellation not cleaning up the current chunk's MID
@@ -1233,19 +1232,16 @@ func TestFileWritePipelinedMIDCleanupOnCancel(t *testing.T) {
 
 		time.Sleep(writeDrainTimeout + time.Second)
 
-		// Verify all MIDs were cleaned up
-		tree.Session.conn.mu.Lock()
-		remaining := len(tree.Session.conn.pending)
-		remainingMIDs := make([]uint16, 0, len(tree.Session.conn.pending))
-		for mid := range tree.Session.conn.pending {
-			remainingMIDs = append(remainingMIDs, mid)
+		// The requests this server never answered keep their MIDs reserved
+		// for the late replies, so nothing may be left waiting live.
+		live, reserved := pendingByState(tree.Session.conn)
+		t.Logf("MIDs after cancellation: live %v, reserved %v", live, reserved)
+		if len(reserved) != midsAllocated {
+			t.Errorf("%d MIDs reserved for late replies, want the %d never answered", len(reserved), midsAllocated)
 		}
-		t.Logf("MIDs remaining after cancellation: %d (MIDs: %v)", remaining, remainingMIDs)
-		tree.Session.conn.mu.Unlock()
 
-		// The critical assertion: no MID leaks once the drain has finished
-		if remaining != 0 {
-			t.Errorf("MID leak detected: %d MIDs still pending after context cancellation (expected 0, got MIDs: %v)", remaining, remainingMIDs)
+		if len(live) != 0 {
+			t.Errorf("MID leak detected: %v still waiting after the operation returned", live)
 		}
 	})
 }

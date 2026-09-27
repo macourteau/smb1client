@@ -346,9 +346,6 @@ func (f *File) readSequential(buf []byte, offset int64, ctx context.Context) (in
 func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
 
-	// Ensure cancelled requests are cleaned up when function exits
-	defer f.session.conn.cleanupCancelledRequests()
-
 	maxDataPerRead := f.maxReadChunk()
 
 	// Calculate number of chunks needed
@@ -527,15 +524,14 @@ func collectReplies[C pipelinedChunk](ctx context.Context, conn *Conn, timeout t
 	}
 }
 
-// abandonChunks gives up on the replies to chunks still on the wire. They are
-// marked cancelled, so the receive loop discards a reply that turns up later.
+// abandonChunks gives up on the replies to chunks still on the wire. Their
+// MIDs stay reserved until those replies arrive (see pendingRequest).
 func abandonChunks[C pipelinedChunk](conn *Conn, chunks []C) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	for _, chunk := range chunks {
-		if req, ok := conn.pending[chunk.wire().mid]; ok {
-			req.cancelled = true
-		}
+		w := chunk.wire()
+		conn.releaseLocked(w.mid, w.respCh, true)
 	}
 }
 
@@ -802,9 +798,6 @@ func (f *File) writeSequential(data []byte, offset int64, ctx context.Context) (
 // writePipelined performs a pipelined write for improved performance
 func (f *File) writePipelined(data []byte, offset int64, ctx context.Context) (int, error) {
 	logger := logging.FromContext(ctx)
-
-	// Ensure cancelled requests are cleaned up when function exits
-	defer f.session.conn.cleanupCancelledRequests()
 
 	maxDataPerWrite := f.maxWriteChunk()
 

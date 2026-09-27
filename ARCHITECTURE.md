@@ -358,6 +358,14 @@ Connection Goroutine (receive loop):
     7. Remove MID from pending map
 ```
 
+A request whose sender stopped waiting (its context was cancelled, or a
+pipelined drain gave up) is not forgotten: it stays in the pending map marked
+cancelled, keeping its MID out of `allocateMID`'s reach, until the loop sees
+its late reply and discards it or the connection closes. Reissuing the MID
+sooner would deliver that late reply as some other request's answer.
+`allocateMID` makes one pass over the ID space and returns an error if every
+MID is held.
+
 ### Request/Response Pattern
 
 ```
