@@ -155,15 +155,19 @@ func TestAllocateMIDCollision(t *testing.T) {
 		t.Errorf("expected MID 0 on error, got %d", mid)
 	}
 
-	// Free one MID and verify we can allocate it
-	c.mu.Lock()
-	delete(c.pending, 100)
-	c.nextMID = 99
-	c.mu.Unlock()
-
-	c.mu.Lock()
-	mid, err = c.allocateMID()
-	c.mu.Unlock()
+	// Exhaustion tears that connection down (see ErrMIDsExhausted), so the
+	// free-slot search is checked on another with one MID left free.
+	c2 := NewConn(newMockConn())
+	defer c2.Close()
+	c2.mu.Lock()
+	for i := 0; i <= 65535; i++ {
+		if i != 100 {
+			c2.pending[uint16(i)] = &pendingRequest{respCh: make(chan *response, 1)}
+		}
+	}
+	c2.nextMID = 99
+	mid, err = c2.allocateMID()
+	c2.mu.Unlock()
 
 	if err != nil {
 		t.Fatalf("expected successful allocation after freeing MID: %v", err)

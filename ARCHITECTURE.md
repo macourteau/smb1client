@@ -370,8 +370,9 @@ last, so a transaction abandoned before its reply was complete (cancelled or
 failed mid-reassembly) keeps its MID until the connection closes; a listing can
 then never absorb fragments of another. That costs one MID per such
 abandonment for the connection's life.
-`allocateMID` makes one pass over the ID space and returns an error if every
-MID is held.
+`allocateMID` makes one pass over the ID space; if every MID is held it tears
+the connection down and returns `ErrMIDsExhausted`, which wraps
+`ErrConnectionClosed` so callers redial as for any dead connection.
 
 ### Request/Response Pattern
 

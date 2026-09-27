@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -239,4 +241,45 @@ func TestAbandonedTransactionMIDStaysReserved(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestMIDExhaustionTearsTheConnectionDown checks what happens once every MID
+// is held — in practice by abandoned requests whose replies never came. The
+// connection can issue nothing more, so it must fail as a dead connection,
+// which callers and pools recognise and redial, rather than as a live one on
+// which every call errors forever.
+func TestMIDExhaustionTearsTheConnectionDown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mock := newMockConn()
+		conn := NewConn(mock)
+		defer conn.Close()
+		go conn.Receive()
+
+		conn.mu.Lock()
+		for mid := 0; mid <= 0xFFFF; mid++ {
+			if uint16(mid) != reservedMID {
+				conn.pending[uint16(mid)] = &pendingRequest{respCh: make(chan *response, 1), cancelled: true}
+			}
+		}
+		conn.mu.Unlock()
+
+		for _, attempt := range []string{"first request", "next request"} {
+			_, err := conn.sendRecv(smb1.NewHeader(smb1.SMB_COM_ECHO), nil, nil, context.Background())
+			if !errors.Is(err, net.ErrClosed) {
+				t.Errorf("%s: error = %v, want one classified as a closed connection", attempt, err)
+			}
+		}
+
+		select {
+		case <-conn.done:
+		default:
+			t.Error("connection still open after running out of MIDs")
+		}
+		mock.mu.Lock()
+		closed := mock.closed
+		mock.mu.Unlock()
+		if !closed {
+			t.Error("socket left open after running out of MIDs")
+		}
+	})
 }

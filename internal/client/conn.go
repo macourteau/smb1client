@@ -26,6 +26,13 @@ import (
 // testing for io.EOF would misread it as one.
 var ErrConnectionClosed = fmt.Errorf("smb1: connection closed: %w", net.ErrClosed)
 
+// ErrMIDsExhausted reports that every message ID is held, almost always by
+// abandoned requests still reserving theirs for replies that never came (see
+// pendingRequest). Such a connection can issue nothing further, so it is torn
+// down, and the error wraps ErrConnectionClosed so that callers treat it like
+// any other dead connection and dial again.
+var ErrMIDsExhausted = fmt.Errorf("smb1: every message ID is held by a request awaiting its reply: %w", ErrConnectionClosed)
+
 const (
 	// responseQueueDepth is how many response messages may be buffered for a
 	// single in-flight request before the receive loop starts dropping them.
@@ -66,7 +73,7 @@ type response struct {
 // fragment would let the rest be reassembled into whichever request was given
 // the MID next — for a directory listing, entries that are not its own. Each
 // such abandonment costs one of the 65,535 usable MIDs for the connection's
-// life, and allocateMID reports exhaustion as an error.
+// life; running out tears the connection down (see ErrMIDsExhausted).
 type pendingRequest struct {
 	respCh      chan *response
 	cancelled   bool
@@ -181,8 +188,8 @@ func (c *Conn) Close() error {
 // allocateMID allocates the next available message ID.
 // Message IDs wrap around at uint16 max (65535).
 // A MID held by a pending request, including one abandoned and still awaiting
-// its late reply, is skipped. Returns an error rather than waiting if every
-// MID is held, after a single pass over the ID space.
+// its late reply, is skipped. If a single pass over the ID space finds every
+// MID held, the connection is torn down and ErrMIDsExhausted returned.
 // Must be called with c.mu held.
 func (c *Conn) allocateMID() (uint16, error) {
 	start := c.nextMID
@@ -203,7 +210,13 @@ func (c *Conn) allocateMID() (uint16, error) {
 
 		// Wrapped around without finding free MID
 		if c.nextMID == start {
-			return 0, fmt.Errorf("smb1: no available message IDs (>65535 concurrent requests)")
+			c.logger.Warn("Every message ID is held by a request awaiting its reply; closing the connection")
+			c.setErrorLocked(ErrMIDsExhausted)
+			// Closing the socket also ends the receive loop, which would
+			// otherwise wait on a healthy socket for replies that may never
+			// come. Closing a net.Conn takes no lock of ours.
+			c.netbiosConn.Close()
+			return 0, ErrMIDsExhausted
 		}
 	}
 }
@@ -634,7 +647,11 @@ func (c *Conn) connError() error {
 func (c *Conn) setError(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.setErrorLocked(err)
+}
 
+// setErrorLocked is setError for a caller already holding c.mu.
+func (c *Conn) setErrorLocked(err error) {
 	select {
 	case <-c.done:
 		// Already closed
