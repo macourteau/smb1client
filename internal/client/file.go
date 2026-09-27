@@ -42,6 +42,19 @@ const SMBProtocolOverhead = 1024
 // caller that resumes from it rewrites a range that is already there.
 const writeDrainTimeout = 30 * time.Second
 
+// readDrainTimeout bounds how long a pipelined read that stopped early waits
+// for the replies to the requests it had already sent.
+//
+// Those requests are still pending on the server, and a caller that closes the
+// file next would have its CLOSE arrive while they are. Samba 4.13 and later
+// serve reads asynchronously and crash the connection's smbd process on exactly
+// that overlap (reply_close defers the close and then dereferences a NULL fsp),
+// so the replies are collected before Read returns. Each is at most one chunk
+// that the server has already been asked for, so a live server answers well
+// inside this bound; it exists so that one that never does cannot hold a Read
+// forever.
+const readDrainTimeout = 30 * time.Second
+
 // maxPipelineDepth caps how many requests this client keeps in flight, however
 // high a server advertises its MaxMpxCount.
 const maxPipelineDepth = 50
@@ -371,33 +384,13 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 	}
 
 	if sendErr != nil {
-		// Mark any successfully allocated MIDs as cancelled
-		f.session.conn.mu.Lock()
-		for i := 0; i < sent; i++ {
-			if req, ok := f.session.conn.pending[chunks[i].mid]; ok {
-				req.cancelled = true
-			}
-		}
-		f.session.conn.mu.Unlock()
+		f.drainReads(ctx, chunks[:sent], sendErr)
 		return 0, sendErr
 	}
 
 	// Process responses and send remaining requests
 	totalRead := 0
 	nextToSend := maxPipeline
-
-	// Helper function to mark pending requests as cancelled.
-	// The Receive() goroutine will check this flag and skip sending responses.
-	// Cleanup (deletion from pending map) happens when responses arrive or on connection close.
-	cleanupPending := func(startFrom int, endAt int) {
-		f.session.conn.mu.Lock()
-		for j := startFrom; j < endAt; j++ {
-			if req, ok := f.session.conn.pending[chunks[j].mid]; ok {
-				req.cancelled = true
-			}
-		}
-		f.session.conn.mu.Unlock()
-	}
 
 	for i := 0; i < numChunks; i++ {
 		// Only process chunks that were actually sent
@@ -419,13 +412,8 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 			delete(f.session.conn.pending, chunk.mid)
 			f.session.conn.mu.Unlock()
 		case <-ctx.Done():
-			// Mark current chunk and all pending requests as cancelled
-			f.session.conn.mu.Lock()
-			if req, ok := f.session.conn.pending[chunk.mid]; ok {
-				req.cancelled = true
-			}
-			f.session.conn.mu.Unlock()
-			cleanupPending(i+1, nextToSend)
+			// The current chunk is still in flight too.
+			f.drainReads(ctx, chunks[i:nextToSend], ctx.Err())
 			return totalRead, ctx.Err()
 		case <-f.session.conn.done:
 			// Connection closed - setError() or Close() will clean up all pending MIDs
@@ -436,23 +424,20 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		// Handle response error
 		if resp.err != nil {
 			if resp.header != nil && resp.header.Status == smb1.STATUS_END_OF_FILE {
-				// EOF reached - clean up remaining pending requests
-				cleanupPending(i+1, nextToSend)
+				f.drainReads(ctx, chunks[i+1:nextToSend], io.EOF)
 				if totalRead > 0 {
 					return totalRead, nil
 				}
 				return 0, io.EOF
 			}
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			f.drainReads(ctx, chunks[i+1:nextToSend], resp.err)
 			return totalRead, fmt.Errorf("smb1: read failed: %w", resp.err)
 		}
 
 		// Decode response
 		readResp, err := smb1.DecodeReadResponse(resp.params, resp.data)
 		if err != nil {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			f.drainReads(ctx, chunks[i+1:nextToSend], err)
 			return totalRead, fmt.Errorf("smb1: failed to decode read response: %w", err)
 		}
 
@@ -466,8 +451,7 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		// hole. The io.Reader contract permits a short read, so the caller
 		// resumes from the advanced offset.
 		if n < chunk.size {
-			// Clean up remaining pending requests
-			cleanupPending(i+1, nextToSend)
+			f.drainReads(ctx, chunks[i+1:nextToSend], fmt.Errorf("short reply of %d/%d bytes", n, chunk.size))
 			if totalRead > 0 {
 				// Per io.Reader contract: return data with nil error,
 				// next Read() will return (0, io.EOF)
@@ -479,8 +463,9 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 		// Send next request if any remain
 		if nextToSend < numChunks {
 			if err := f.sendReadRequest(chunks[nextToSend], ctx); err != nil {
-				// Clean up remaining pending requests (including the one we just failed to send)
-				cleanupPending(i+1, nextToSend)
+				// The failed request was never registered; the ones before it
+				// were.
+				f.drainReads(ctx, chunks[i+1:nextToSend], err)
 				return totalRead, err
 			}
 			nextToSend++
@@ -488,6 +473,50 @@ func (f *File) readPipelined(buf []byte, offset int64, ctx context.Context) (int
 	}
 
 	return totalRead, nil
+}
+
+// drainReads collects the replies to pipelined reads that were sent but whose
+// data is no longer wanted, because the read stopped early for the reason
+// given. See readDrainTimeout for why they are waited for at all rather than
+// abandoned.
+//
+// The wait deliberately ignores ctx: a caller that cancelled is the one most
+// likely to close the file next. A request whose reply does not arrive within
+// the bound is marked cancelled, which readPipelined's deferred cleanup then
+// releases.
+func (f *File) drainReads(ctx context.Context, chunks []*readChunk, cause error) {
+	if len(chunks) == 0 {
+		return
+	}
+	logger := logging.FromContext(ctx)
+	conn := f.session.conn
+	logger.Debug("readPipelined: stopped early (%v), collecting %d replies still in flight", cause, len(chunks))
+
+	deadline := time.NewTimer(readDrainTimeout)
+	defer deadline.Stop()
+
+	for i, chunk := range chunks {
+		select {
+		case <-chunk.respCh:
+			conn.mu.Lock()
+			delete(conn.pending, chunk.mid)
+			conn.mu.Unlock()
+		case <-deadline.C:
+			logger.Warn("readPipelined: gave up after %s waiting for %d read replies; the server may still hold them",
+				readDrainTimeout, len(chunks)-i)
+			conn.mu.Lock()
+			for _, abandoned := range chunks[i:] {
+				if req, ok := conn.pending[abandoned.mid]; ok {
+					req.cancelled = true
+				}
+			}
+			conn.mu.Unlock()
+			return
+		case <-conn.done:
+			// Teardown wakes and unregisters every pending request itself.
+			return
+		}
+	}
 }
 
 // sendReadRequest sends a single pipelined read request

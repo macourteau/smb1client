@@ -1093,11 +1093,13 @@ func TestFileReadPipelinedMIDCleanupOnCancel(t *testing.T) {
 
 		// Channel to signal when read has started
 		readStarted := make(chan struct{})
+		readDone := make(chan struct{})
 
 		// Start read in goroutine
 		go func() {
 			close(readStarted)
 			f.Read(buf, ctx)
+			close(readDone)
 		}()
 
 		// Wait for read to start
@@ -1124,8 +1126,9 @@ func TestFileReadPipelinedMIDCleanupOnCancel(t *testing.T) {
 		// Cancel the context
 		cancel()
 
-		// Give time for cleanup to complete
-		time.Sleep(100 * time.Millisecond)
+		// This server never answers, so Read returns only once its bounded
+		// wait for the requests already sent gives up (see readDrainTimeout).
+		<-readDone
 
 		// Verify all MIDs were cleaned up
 		tree.Session.conn.mu.Lock()

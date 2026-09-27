@@ -335,6 +335,13 @@ MaxMpxCount (capped client-side). Without CAP_LARGE_READX a read chunk is at
 most 65,520 bytes (uint16 length field); with it, 130,048 bytes (127 KiB).
 Write chunks are 130,048 bytes.
 
+A pipelined read that stops before its last chunk — a short or empty reply,
+end of file, an error, or cancellation — collects the replies to every request
+it had already sent before returning, bounded by `readDrainTimeout`. Abandoning
+them would let the caller's next CLOSE reach the server while those reads are
+still pending there, and Samba 4.13 and later crash the connection's smbd
+process on that overlap when reads are served asynchronously (the default).
+
 ### Background Receive Loop
 
 ```
