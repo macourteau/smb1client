@@ -353,6 +353,8 @@ if err != nil {
     // Check specific error types
     if smb1.IsNotFoundError(err) {
         log.Println("File not found")
+    } else if smb1.IsSharingViolation(err) {
+        log.Println("Open elsewhere; retry later")
     } else if smb1.IsPermissionError(err) {
         log.Println("Permission denied")
     } else if smb1.IsAuthError(err) {
@@ -472,6 +474,21 @@ migrating:
 - `Rename` does not replace an existing target — `SMB_COM_RENAME` fails with
   `STATUS_OBJECT_NAME_COLLISION` (detect with `IsExistError`). go-smb2's
   `Rename` also does not overwrite an existing target.
+- `Remove` on a directory sends `SMB_COM_DELETE_DIRECTORY`, so a non-empty
+  directory fails with `*os.PathError{Op: "remove"}` wrapping a
+  `*ResponseError` whose `Code` is `STATUS_DIRECTORY_NOT_EMPTY`
+  (`0xC0000101`) — the same shape go-smb2 returns, detected the same way with
+  `errors.As`. (Some SMB1 servers, e.g. Samba 4.9.5, acknowledge a
+  delete-on-close open of a non-empty directory and then keep it, so that
+  route cannot be trusted to report the failure.)
+- A sharing violation (another open excludes the requested access) maps to a
+  permission error, as every access failure does: `errors.Is(err,
+  os.ErrPermission)` and `IsPermissionError` report true. Its cause also
+  carries the `*ResponseError` (`STATUS_SHARING_VIOLATION`, `0xC0000043`),
+  which `IsSharingViolation` detects — an addition to the go-smb2 surface,
+  which has no such classifier. Because that cause is a joined error,
+  `os.IsPermission` (which compares by identity, not `errors.Is`) reports
+  false for it, as it does for go-smb2's bare `*ResponseError`.
 - `File.ReadFrom` and `File.WriteTo` are client-side streaming in buffered
   chunks. Unlike go-smb2, no server-side copy is attempted when the other end
   is also a remote file; the data always flows through the client.

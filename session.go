@@ -55,12 +55,38 @@ func mapSMBErrorToOSError(err error, op, path string) error {
 
 	// Check for permission errors using error classification
 	if IsPermissionError(err) {
-		return &os.PathError{Op: op, Path: path, Err: os.ErrPermission}
+		return &os.PathError{Op: op, Path: path, Err: permissionError(err)}
 	}
 
 	// Return original error wrapped in PathError, classifying context and
 	// transport failures on the way out.
 	return &os.PathError{Op: op, Path: path, Err: wrapError(err)}
+}
+
+// permissionError is the cause a mapped permission failure carries. It is
+// os.ErrPermission, except that a sharing violation also keeps its status
+// (as *ResponseError) so IsSharingViolation can tell "someone else has it
+// open" from a lasting denial. errors.Is(err, os.ErrPermission) holds either
+// way; os.IsPermission, which compares the cause by identity, does not see
+// through the joined form — the same as go-smb2, whose cause is a bare
+// *ResponseError.
+func permissionError(err error) error {
+	if IsSharingViolation(err) {
+		return fmt.Errorf("%w: %w", os.ErrPermission, &ResponseError{Code: uint32(erref.STATUS_SHARING_VIOLATION)})
+	}
+	return os.ErrPermission
+}
+
+// mapRemoveDirError maps a failed SMB_COM_DELETE_DIRECTORY. A non-empty
+// directory comes back in go-smb2's shape — the *ResponseError carrying
+// STATUS_DIRECTORY_NOT_EMPTY — so a caller ported from go-smb2 detects it
+// with errors.As unchanged; everything else maps as for any other operation.
+func mapRemoveDirError(err error, name string) error {
+	var status erref.NtStatus
+	if errors.As(err, &status) && status == erref.STATUS_DIRECTORY_NOT_EMPTY {
+		return &os.PathError{Op: "remove", Path: name, Err: &ResponseError{Code: uint32(status)}}
+	}
+	return mapSMBErrorToOSError(err, "remove", name)
 }
 
 // mapSMBErrorToLinkError maps SMB protocol errors to os.LinkError for operations
@@ -77,7 +103,7 @@ func mapSMBErrorToLinkError(err error, op, oldpath, newpath string) error {
 
 	// Check for permission errors using error classification
 	if IsPermissionError(err) {
-		return &os.LinkError{Op: op, Old: oldpath, New: newpath, Err: os.ErrPermission}
+		return &os.LinkError{Op: op, Old: oldpath, New: newpath, Err: permissionError(err)}
 	}
 
 	// Return original error wrapped in LinkError, classifying context and
@@ -620,59 +646,30 @@ func (fs *Share) Remove(name string) error {
 		return &os.PathError{Op: "remove", Path: name, Err: err}
 	}
 
-	// Open the file/directory with DELETE access and FILE_DELETE_ON_CLOSE option
+	// Directories go through SMB_COM_DELETE_DIRECTORY rather than a
+	// delete-on-close open: Samba 4.9.5 (as shipped on ASIAIR devices)
+	// acknowledges every step of a delete-on-close open of a non-empty
+	// directory and then leaves the directory in place, so Remove would
+	// report success for a delete that never happened. DELETE_DIRECTORY fails
+	// with STATUS_DIRECTORY_NOT_EMPTY instead. The Stat above already tells
+	// the two cases apart, so picking the command costs no extra round trip
+	// (and the directory delete itself drops from NT_CREATE + CLOSE to one
+	// request); trying the file delete first would instead spend a failed
+	// request on every directory.
+	if stat.IsDir() {
+		return fs.removeDir(name)
+	}
+
+	// Open the file with DELETE access and FILE_DELETE_ON_CLOSE option.
 	// This will mark it for deletion. When we close the handle, it will be deleted.
 	access := smb1.DELETE
 	sharemode := smb1.FILE_SHARE_READ | smb1.FILE_SHARE_WRITE | smb1.FILE_SHARE_DELETE
 	createmode := smb1.FILE_OPEN // Must exist
-	createOptions := smb1.FILE_DELETE_ON_CLOSE
-
-	// Use FILE_DIRECTORY_FILE for directories, FILE_NON_DIRECTORY_FILE for files
-	if stat.IsDir() {
-		createOptions |= smb1.FILE_DIRECTORY_FILE
-	} else {
-		createOptions |= smb1.FILE_NON_DIRECTORY_FILE
-	}
+	createOptions := smb1.FILE_DELETE_ON_CLOSE | smb1.FILE_NON_DIRECTORY_FILE
 
 	f, err := fs.tree.OpenFile(name, access, sharemode, createmode, createOptions, fs.ctx)
 	if err != nil {
-		// A sharing violation on a directory means something still holds it
-		// open. This client closes its own search handles at end of search, so
-		// what is left is another client's handle, which will go away on its
-		// own schedule — retry with increasing delays rather than fail outright.
-		if stat.IsDir() && isSharingViolation(err) {
-			logger := LoggerFromContext(fs.ctx)
-			logger.Warn("Sharing violation removing directory %s, retrying: %v", name, err)
-
-			// Retry with exponential backoff (total ~5 seconds)
-			for i := 0; i < maxRemoveRetries; i++ {
-				delay := time.Duration(50*(1<<uint(i))) * time.Millisecond // 50ms, 100ms, 200ms, ...
-				if delay > 1*time.Second {
-					delay = 1 * time.Second
-				}
-
-				// Check for context cancellation during sleep
-				select {
-				case <-time.After(delay):
-					// Continue with retry
-				case <-fs.ctx.Done():
-					return &os.PathError{Op: "remove", Path: name, Err: wrapError(fs.ctx.Err())}
-				}
-
-				f, err = fs.tree.OpenFile(name, access, sharemode, createmode, createOptions, fs.ctx)
-				if err == nil {
-					logger.Warn("Directory %s became removable after %d retries", name, i+1)
-					break
-				}
-			}
-			if err != nil {
-				logger.Error("Directory %s still held open after %d retries: %v", name, maxRemoveRetries, err)
-				return mapSMBErrorToOSError(err, "remove", name)
-			}
-			// Fall through to close and return
-		} else {
-			return mapSMBErrorToOSError(err, "remove", name)
-		}
+		return mapSMBErrorToOSError(err, "remove", name)
 	}
 
 	// Close the file to complete the deletion
@@ -683,22 +680,51 @@ func (fs *Share) Remove(name string) error {
 	return nil
 }
 
-// isSharingViolation reports whether err carries STATUS_SHARING_VIOLATION.
-// Matching the status is what makes this reliable: the same condition reaches
-// callers with several different message texts depending on how deep it was
-// wrapped.
-func isSharingViolation(err error) bool {
-	var respErr *ResponseError
-	if errors.As(err, &respErr) {
-		return erref.NtStatus(respErr.Code) == erref.STATUS_SHARING_VIOLATION
+// removeDir removes the empty directory name with SMB_COM_DELETE_DIRECTORY.
+func (fs *Share) removeDir(name string) error {
+	err := fs.tree.SendDeleteDirectory(name, fs.ctx)
+	if err == nil {
+		return nil
 	}
 
-	var status erref.NtStatus
-	if errors.As(err, &status) {
-		return status == erref.STATUS_SHARING_VIOLATION
+	// A sharing violation means something still holds the directory open.
+	// This client closes its own search handles at end of search, so what is
+	// left is another client's handle, which will go away on its own
+	// schedule — retry with increasing delays rather than fail outright.
+	if IsSharingViolation(err) {
+		logger := LoggerFromContext(fs.ctx)
+		logger.Warn("Sharing violation removing directory %s, retrying: %v", name, err)
+
+		// Retry with exponential backoff (total ~5 seconds)
+		for i := 0; i < maxRemoveRetries; i++ {
+			delay := time.Duration(50*(1<<uint(i))) * time.Millisecond // 50ms, 100ms, 200ms, ...
+			if delay > 1*time.Second {
+				delay = 1 * time.Second
+			}
+
+			// Check for context cancellation during sleep
+			select {
+			case <-time.After(delay):
+				// Continue with retry
+			case <-fs.ctx.Done():
+				return &os.PathError{Op: "remove", Path: name, Err: wrapError(fs.ctx.Err())}
+			}
+
+			err = fs.tree.SendDeleteDirectory(name, fs.ctx)
+			if err == nil {
+				logger.Warn("Directory %s became removable after %d retries", name, i+1)
+				return nil
+			}
+			if !IsSharingViolation(err) {
+				break
+			}
+		}
+		if IsSharingViolation(err) {
+			logger.Error("Directory %s still held open after %d retries: %v", name, maxRemoveRetries, err)
+		}
 	}
 
-	return false
+	return mapRemoveDirError(err, name)
 }
 
 // RemoveAll removes path and any children it contains.

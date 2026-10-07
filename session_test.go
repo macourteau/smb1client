@@ -172,6 +172,30 @@ func TestUNCServerName(t *testing.T) {
 	}
 }
 
+// A sharing violation is a permission error to callers that only ask
+// errors.Is(err, os.ErrPermission) — the go-smb2-compatible view — and must
+// also stay distinguishable through IsSharingViolation once the public API
+// has mapped it, so a caller can tell "someone has it open, retry later" from
+// "you may not". (os.IsPermission compares the cause by identity and so
+// reports false here, as it does for go-smb2's bare *ResponseError cause.)
+func TestMappedSharingViolationStaysPermission(t *testing.T) {
+	sharing := smb1internal.StatusToError(0xC0000043)
+	for _, err := range []error{
+		mapSMBErrorToOSError(sharing, "remove", "f"),
+		mapSMBErrorToLinkError(sharing, "rename", "a", "b"),
+	} {
+		if !errors.Is(err, os.ErrPermission) {
+			t.Errorf("errors.Is(%v, os.ErrPermission) = false, want true", err)
+		}
+		if !IsPermissionError(err) {
+			t.Errorf("IsPermissionError(%v) = false, want true", err)
+		}
+		if !IsSharingViolation(err) {
+			t.Errorf("IsSharingViolation(%v) = false, want true", err)
+		}
+	}
+}
+
 func TestIsSharingViolation(t *testing.T) {
 	sharing := smb1internal.StatusToError(0xC0000043)
 	accessDenied := smb1internal.StatusToError(0xC0000022)
@@ -186,14 +210,18 @@ func TestIsSharingViolation(t *testing.T) {
 		{name: "wrapped once", err: fmt.Errorf("smb1: nt create failed: %w", sharing), want: true},
 		{name: "wrapped twice", err: fmt.Errorf("remove: %w", fmt.Errorf("smb1: nt create failed: %w", sharing)), want: true},
 		{name: "inside a PathError", err: &os.PathError{Op: "remove", Path: "d", Err: sharing}, want: true},
+		{name: "as a ResponseError", err: &ResponseError{Code: 0xC0000043}, want: true},
+		{name: "mapped to a PathError", err: mapSMBErrorToOSError(sharing, "remove", "f"), want: true},
+		{name: "mapped to a LinkError", err: mapSMBErrorToLinkError(sharing, "rename", "a", "b"), want: true},
+		{name: "mapped access denied", err: mapSMBErrorToOSError(accessDenied, "remove", "f"), want: false},
 		{name: "a different status", err: accessDenied, want: false},
 		{name: "an unrelated error", err: errors.New("share access flags are incompatible"), want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isSharingViolation(tt.err); got != tt.want {
-				t.Errorf("isSharingViolation(%v) = %v, want %v", tt.err, got, tt.want)
+			if got := IsSharingViolation(tt.err); got != tt.want {
+				t.Errorf("IsSharingViolation(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
