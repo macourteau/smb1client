@@ -414,6 +414,33 @@ func IsExistError(err error) bool {
 	return false
 }
 
+// IsSharingViolation returns true if the error carries
+// STATUS_SHARING_VIOLATION: another open of the file or directory has share
+// modes that exclude the requested access, so the operation may succeed once
+// that handle is closed. A sharing violation is also a permission error
+// (IsPermissionError and errors.Is(err, os.ErrPermission) report true);
+// this predicate tells it apart from a lasting access denial.
+func IsSharingViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// errors.As walks *os.PathError, *os.LinkError and joined errors, so no
+	// explicit unwrapping is needed.
+	var respErr *ResponseError
+	if errors.As(err, &respErr) {
+		return erref.NtStatus(respErr.Code) == erref.STATUS_SHARING_VIOLATION
+	}
+
+	// Check for erref.NtStatus directly (this is what StatusToError returns)
+	var status erref.NtStatus
+	if errors.As(err, &status) {
+		return status == erref.STATUS_SHARING_VIOLATION
+	}
+
+	return false
+}
+
 // IsTimeoutError returns true if the error indicates a timeout.
 func IsTimeoutError(err error) bool {
 	if err == nil {

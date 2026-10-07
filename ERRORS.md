@@ -334,13 +334,20 @@ func mapSMBErrorToOSError(err error, op, path string) error {
     }
 
     if IsPermissionError(err) {
-        return &os.PathError{Op: op, Path: path, Err: os.ErrPermission}
+        return &os.PathError{Op: op, Path: path, Err: permissionError(err)}
     }
 
     // Wrap original error, classifying context and transport failures
     return &os.PathError{Op: op, Path: path, Err: wrapError(err)}
 }
 ```
+
+`permissionError` returns `os.ErrPermission`, except for a sharing violation,
+whose cause joins `os.ErrPermission` with `&ResponseError{Code:
+STATUS_SHARING_VIOLATION}` so `errors.Is(err, os.ErrPermission)` and
+`IsSharingViolation(err)` both hold. Translation never discards a status a
+caller needs to act on: `Remove` likewise keeps `STATUS_DIRECTORY_NOT_EMPTY`
+as a `*ResponseError` cause (go-smb2's shape) rather than flattening it.
 
 This allows callers to use both SMB-specific checks and standard Go error checks:
 
@@ -397,6 +404,10 @@ func IsPermissionError(err error) bool
 
 // File/object already exists
 func IsExistError(err error) bool
+
+// Another open excludes the requested access (STATUS_SHARING_VIOLATION);
+// also a permission error, but one that may clear once that handle closes
+func IsSharingViolation(err error) bool
 
 // Timeout errors
 func IsTimeoutError(err error) bool

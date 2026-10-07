@@ -423,6 +423,37 @@ func (t *Tree) SendRename(oldpath, newpath string, ctx context.Context) error {
 	return err
 }
 
+// SendDeleteDirectory sends an SMB_COM_DELETE_DIRECTORY request, which
+// removes the directory at path only if it is empty. The server's status is
+// returned unchanged, so a non-empty directory surfaces as
+// STATUS_DIRECTORY_NOT_EMPTY.
+func (t *Tree) SendDeleteDirectory(path string, ctx context.Context) error {
+	req := &smb1.DeleteDirectoryRequest{
+		DirectoryName: path,
+		UseUnicode:    (t.Session.conn.capabilities & smb1.CAP_UNICODE) != 0,
+	}
+
+	params, data, err := smb1.EncodeDeleteDirectoryRequest(req)
+	if err != nil {
+		return err
+	}
+
+	header := smb1.NewHeader(smb1.SMB_COM_DELETE_DIRECTORY)
+	header.UID = t.Session.uid
+	header.TID = t.TID
+
+	resp, err := t.Session.conn.sendRecv(header, params, data, ctx)
+	if err != nil {
+		return err
+	}
+
+	if resp.err != nil {
+		return resp.err
+	}
+
+	return smb1.DecodeDeleteDirectoryResponse(resp.params, resp.data)
+}
+
 // SendSetInformation sends a core-protocol SMB_COM_SET_INFORMATION request,
 // setting the DOS file attributes (and optionally the UTIME last-write time;
 // 0 leaves it unchanged) of the file at path. This is the legacy set-attributes
